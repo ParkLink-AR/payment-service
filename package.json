@@ -1,0 +1,30 @@
+{
+  "name": "payment-service",
+  "version": "1.0.0",
+  "description": "Payment microservice with Mercado Pago checkout",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
+    "test:links": "node test/print-valid-links.test.js",
+    "lint:security": "npx eslint src/ --max-warnings=50"
+  },
+  "dependencies": {
+    "@mercadopago/sdk-react": "^1.0.7",
+    "dd-trace": "^5.110.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.3",
+    "mercadopago": "^2.5.0",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "eslint": "^10.6.0",
+    "eslint-plugin-security": "^4.0.1",
+    "jest": "^30.4.2",
+    "nodemon": "^3.1.4",
+    "supertest": "^7.2.2"
+  }
+}
