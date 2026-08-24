@@ -197,61 +197,36 @@ export function createApp() {
 
       // Guardar la transacción independientemente del estado
       const transaction = await saveTransaction(payment);
-      const externalReference = payment.external_reference || transaction.external_reference;
 
-      // Definir estados que requieren reconciliación con order-service
-      const APPROVED_STATUSES = ['approved'];
-      const REJECTED_STATUSES = ['rejected', 'cancelled', 'refunded'];
-      const PENDING_STATUSES = ['pending', 'in_process', 'in_mediation'];
+      // Cuando el pago es aprobado, confirmar la reserva en booking-service.
+      // El booking_id viaja en el external_reference (UUID que payment-service
+      // genera en /create-preference y que la app adjunta al crear la preferencia).
+      const bookingId = payment.external_reference || transaction.external_reference;
 
-      let shouldReconcile = false;
-      let reconciliationStatus = paymentStatus;
-
-      if (APPROVED_STATUSES.includes(paymentStatus)) {
-        shouldReconcile = true;
-        reconciliationStatus = 'approved';
-        console.log(`[Payment Webhook] Payment approved - will reconcile as 'approved'`);
-      } else if (REJECTED_STATUSES.includes(paymentStatus)) {
-        shouldReconcile = true;
-        reconciliationStatus = 'rejected';
-        console.log(`[Payment Webhook] Payment rejected/cancelled - will reconcile as 'rejected'`);
-      } else if (PENDING_STATUSES.includes(paymentStatus)) {
-        shouldReconcile = true;
-        reconciliationStatus = 'pending';
-        console.log(`[Payment Webhook] Payment pending - will reconcile as 'pending'`);
-      } else {
-        console.log(`[Payment Webhook] Payment status '${paymentStatus}' - no reconciliation needed`);
-      }
-
-      if (shouldReconcile && externalReference) {
-        const headers = {
-          'Content-Type': 'application/json',
-        };
-
-        if (config.orderServiceAuthToken) {
-          headers.Authorization = `Bearer ${config.orderServiceAuthToken}`;
+      if (paymentStatus === 'approved' && bookingId) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (config.bookingServiceAuthToken) {
+          headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
         }
 
         try {
-          const reconcileResponse = await fetch(`${config.orderServiceUrl}/api/v1/orders/payments/reconcile`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-              payment_id: String(payment.id),
-              preference_id: payment.order?.id ? String(payment.order.id) : null,
-              external_reference: externalReference,
-              status: reconciliationStatus,
-            }),
-          });
+          const confirmResponse = await fetch(
+            `${config.bookingServiceUrl}/bookings/${bookingId}/confirm`,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ payment_id: String(payment.id) }),
+            }
+          );
 
-          if (!reconcileResponse.ok) {
-            const errorText = await reconcileResponse.text();
-            console.error(`[Payment Webhook] Order reconciliation failed: ${reconcileResponse.status} - ${errorText}`);
+          if (!confirmResponse.ok) {
+            const errorText = await confirmResponse.text();
+            console.error(`[Payment Webhook] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
           } else {
-            console.log(`[Payment Webhook] Order reconciled successfully with status: ${reconciliationStatus}`);
+            console.log(`[Payment Webhook] Booking ${bookingId} confirmed with payment ${payment.id}`);
           }
-        } catch (reconcileError) {
-          console.error('[Payment Webhook] Error calling order reconciliation:', reconcileError.message);
+        } catch (confirmError) {
+          console.error('[Payment Webhook] Error confirming booking:', confirmError.message);
         }
       }
 
@@ -259,8 +234,7 @@ export function createApp() {
         message: 'Webhook processed successfully',
         transactionId: transaction.id,
         paymentStatus: paymentStatus,
-        reconciliationStatus: shouldReconcile ? reconciliationStatus : null,
-        externalReference: externalReference || null,
+        bookingId: bookingId || null,
       });
     } catch (error) {
       console.error('[Payment Webhook] Error processing webhook:', error);

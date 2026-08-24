@@ -148,9 +148,9 @@ describe('Payment Service App', () => {
       expect(res.body.message).toBe('Webhook ignored');
     });
 
-    it('should process payment and reconcile if approved', async () => {
-      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'approved', external_reference: 'ext_123' });
-      saveTransaction.mockResolvedValueOnce({ id: 'txn_123', external_reference: 'ext_123' });
+    it('should process payment and confirm booking if approved', async () => {
+      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'approved', external_reference: 'booking-uuid-123' });
+      saveTransaction.mockResolvedValueOnce({ id: 'txn_123', external_reference: 'booking-uuid-123' });
       global.fetch.mockResolvedValueOnce({ ok: true });
 
       const headers = getValidHeaders('123');
@@ -160,7 +160,7 @@ describe('Payment Service App', () => {
       
       expect(res.status).toBe(200);
       expect(res.body.paymentStatus).toBe('approved');
-      expect(res.body.reconciliationStatus).toBe('approved');
+      expect(res.body.bookingId).toBe('booking-uuid-123');
       expect(saveTransaction).toHaveBeenCalled();
       expect(global.fetch).toHaveBeenCalled();
     });

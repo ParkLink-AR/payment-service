@@ -43,7 +43,7 @@ export const config = {
   frontendFailureUrl: process.env.FRONTEND_FAILURE_URL || 'http://localhost:19006/payment/failure',
   frontendPendingUrl: process.env.FRONTEND_PENDING_URL || 'http://localhost:19006/payment/pending',
   defaultCurrency: process.env.DEFAULT_CURRENCY || 'ARS',
-  orderServiceUrl: process.env.ORDER_SERVICE_URL || 'http://localhost:8003',
-  orderServiceAuthToken: process.env.ORDER_SERVICE_AUTH_TOKEN || '',
+  bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
+  bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
   mercadoPagoWebhookSecret: webhookSecret,
 };
