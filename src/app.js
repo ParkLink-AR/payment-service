@@ -92,6 +92,70 @@ export function createApp() {
     }
   });
 
+  // ── Demo payment endpoint ──────────────────────────────────────────────────
+  // Instantly marks a booking as paid without going through MercadoPago.
+  // Used for demos where the real payment gateway is unavailable.
+  app.post('/api/payments/demo-pay', async (req, res) => {
+    try {
+      const { bookingId, amount, payerEmail } = req.body;
+
+      if (!bookingId) {
+        return res.status(400).json({ message: 'bookingId is required' });
+      }
+
+      const paymentId = `demo-${crypto.randomUUID()}`;
+      const fakePayment = {
+        id: paymentId,
+        status: 'approved',
+        transaction_amount: Number(amount) || 0,
+        currency_id: 'ARS',
+        external_reference: bookingId,
+        payer: { email: payerEmail || 'demo@pll.com' },
+        date_approved: new Date().toISOString(),
+        order: {},
+        metadata: {},
+      };
+
+      const transaction = await saveTransaction(fakePayment);
+
+      // Confirm the booking in booking-service
+      const headers = { 'Content-Type': 'application/json' };
+      if (config.bookingServiceAuthToken) {
+        headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
+      }
+
+      try {
+        const confirmResponse = await fetch(
+          `${config.bookingServiceUrl}/bookings/${bookingId}/confirm`,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ payment_id: paymentId }),
+          }
+        );
+
+        if (!confirmResponse.ok) {
+          const errorText = await confirmResponse.text();
+          console.error(`[Demo Pay] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
+        } else {
+          console.log(`[Demo Pay] Booking ${bookingId} confirmed with payment ${paymentId}`);
+        }
+      } catch (confirmError) {
+        console.error('[Demo Pay] Error confirming booking:', confirmError.message);
+      }
+
+      return res.status(201).json({
+        paymentId,
+        status: 'approved',
+        bookingId,
+        transactionId: transaction.id,
+      });
+    } catch (error) {
+      console.error('[Demo Pay] Error:', error);
+      return res.status(500).json({ message: 'Demo payment error', detail: error.message });
+    }
+  });
+
   app.post('/api/payments/create-preference', async (req, res) => {
     try {
       // Log token for debugging
@@ -121,11 +185,14 @@ export function createApp() {
       const payerEmail = forcedPayerEmail || req.body?.payerEmail || undefined;
       const externalReference = req.body?.externalReference || crypto.randomUUID();
 
-      const backUrls = {
-        success: config.frontendSuccessUrl,
-        failure: config.frontendFailureUrl,
-        pending: config.frontendPendingUrl,
-      };
+      const backUrls =
+        config.frontendSuccessUrl || config.frontendFailureUrl || config.frontendPendingUrl
+          ? {
+              success: config.frontendSuccessUrl || undefined,
+              failure: config.frontendFailureUrl || undefined,
+              pending: config.frontendPendingUrl || undefined,
+            }
+          : undefined;
 
       console.log('[Payment Service] Creating preference with backUrls:', backUrls);
       if (forcedPayerEmail) {

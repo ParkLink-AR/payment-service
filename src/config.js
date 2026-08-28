@@ -16,12 +16,13 @@ for (const key of requiredEnv) {
   }
 }
 
+// MercadoPago credentials are optional when running in demo mode
 if (!webhookSecret) {
-  throw new Error('Missing required environment variable: MERCADOPAGO_WEBHOOK_SECRET (or MERCADO_PAGO_WEBHOOK_SECRET)');
+  console.warn('[Config] MERCADOPAGO_WEBHOOK_SECRET not set — MercadoPago webhook verification disabled (demo mode).');
 }
 
 if (!accessToken) {
-  throw new Error('Missing required environment variable: MERCADOPAGO_ACCESS_TOKEN (or MP_ACCESS_TOKEN)');
+  console.warn('[Config] MERCADOPAGO_ACCESS_TOKEN not set — MercadoPago checkout disabled (demo mode).');
 }
 
 /* // Common misconfiguration: frontend/public key pasted into backend token variable.
@@ -39,9 +40,9 @@ export const config = {
   forceTestPayerEmail: process.env.MP_FORCE_TEST_PAYER_EMAIL || '',
   appBaseUrl: process.env.APP_BASE_URL || 'http://localhost:8004',
   webhookBaseUrl: process.env.WEBHOOK_BASE_URL || process.env.APP_BASE_URL || 'http://localhost:8004',
-  frontendSuccessUrl: process.env.FRONTEND_SUCCESS_URL || 'http://localhost:19006/payment/success',
-  frontendFailureUrl: process.env.FRONTEND_FAILURE_URL || 'http://localhost:19006/payment/failure',
-  frontendPendingUrl: process.env.FRONTEND_PENDING_URL || 'http://localhost:19006/payment/pending',
+  frontendSuccessUrl: process.env.FRONTEND_SUCCESS_URL || '',
+  frontendFailureUrl: process.env.FRONTEND_FAILURE_URL || '',
+  frontendPendingUrl: process.env.FRONTEND_PENDING_URL || '',
   defaultCurrency: process.env.DEFAULT_CURRENCY || 'ARS',
   bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
   bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
