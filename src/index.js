@@ -7,13 +7,11 @@ async function bootstrap() {
   const app = createApp();
 
   app.listen(config.port, () => {
-    // eslint-disable-next-line no-console
     console.log(`payment-service listening on port ${config.port}`);
   });
 }
 
 bootstrap().catch((error) => {
-  // eslint-disable-next-line no-console
   console.error('Failed to start payment-service', error);
   process.exit(1);
 });
