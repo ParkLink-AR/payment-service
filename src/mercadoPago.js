@@ -83,6 +83,21 @@ export async function generateExternalReference() {
   return { externalReference: crypto.randomUUID() };
 }
 
+/**
+ * Looks up the most recent payment for a given external_reference (the
+ * bookingId) directly against Mercado Pago's Search API. Unlike getPaymentById
+ * (which needs MP's own payment id), this only needs the reference the app
+ * already has -- it's what lets /api/payments/verify-status resolve a
+ * payment's status by polling, with no dependency on the webhook ever
+ * reaching us (no ngrok/public URL required in local dev).
+ */
+export async function searchPaymentByExternalReference(externalReference) {
+  const response = await paymentClient.search({
+    options: { external_reference: externalReference, sort: 'date_created', criteria: 'desc' },
+  });
+  return response?.results?.[0] ?? null;
+}
+
 export async function getPaymentById(paymentId) {
   const idStr = String(paymentId);
   if (idStr.startsWith('mock-')) {

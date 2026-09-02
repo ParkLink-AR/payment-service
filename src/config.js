@@ -47,4 +47,8 @@ export const config = {
   bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
   bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
   mercadoPagoWebhookSecret: webhookSecret,
+  // admin-dashboard fetches /api/payments/metrics directly (not through the
+  // gateway), so this service needs its own CORS allowlist. Same default as
+  // gateway's own CORS_ORIGINS -- tighten in production via env.
+  corsOrigins: process.env.CORS_ORIGINS || '*',
 };

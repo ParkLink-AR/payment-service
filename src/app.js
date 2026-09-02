@@ -1,8 +1,14 @@
 import crypto from 'crypto';
 import express from 'express';
+import cors from 'cors';
 import { config } from './config.js';
 import { getTransactionByExternalReference, getTransactionByPaymentId, pool, saveTransaction, markTransactionAsRefunded } from './db.js';
-import { createCheckoutPreference, generateExternalReference, getPaymentById } from './mercadoPago.js';
+import {
+  createCheckoutPreference,
+  generateExternalReference,
+  getPaymentById,
+  searchPaymentByExternalReference,
+} from './mercadoPago.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
 import { requireAdmin } from './security.js';
 
@@ -79,8 +85,53 @@ function verifyMercadoPagoWebhookSignature(req) {
   return { ok: true };
 }
 
+// Confirms the booking in booking-service once its payment is approved.
+// The bookingId travels as the payment's external_reference (set by the app
+// in /create-preference). Shared by the webhook handler, demo-pay, and
+// verify-status's polling fallback -- ConfirmBooking on booking-service's
+// side only updates rows still PENDING_PAYMENT, so calling this more than
+// once for the same booking (e.g. webhook *and* a poll both catching the
+// same approval) is a harmless no-op the second time.
+async function confirmBookingIfApproved(payment) {
+  if (!payment || payment.status !== 'approved') {
+    return;
+  }
+
+  const bookingId = payment.external_reference;
+  if (!bookingId) {
+    return;
+  }
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (config.bookingServiceAuthToken) {
+    headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
+  }
+
+  try {
+    const confirmResponse = await fetch(`${config.bookingServiceUrl}/bookings/${bookingId}/confirm`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ payment_id: String(payment.id) }),
+    });
+
+    if (!confirmResponse.ok) {
+      const errorText = await confirmResponse.text();
+      console.error(`[Payment] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
+    } else {
+      console.log(`[Payment] Booking ${bookingId} confirmed with payment ${payment.id}`);
+    }
+  } catch (confirmError) {
+    console.error('[Payment] Error confirming booking:', confirmError.message);
+  }
+}
+
 export function createApp() {
   const app = express();
+  app.use(
+    cors({
+      origin: config.corsOrigins === '*' ? '*' : config.corsOrigins.split(',').map((o) => o.trim()),
+    }),
+  );
   app.use(express.json());
 
   app.get('/health', async (_req, res) => {
@@ -94,8 +145,11 @@ export function createApp() {
 
   // ── Demo payment endpoint ──────────────────────────────────────────────────
   // Instantly marks a booking as paid without going through MercadoPago.
-  // Used for demos where the real payment gateway is unavailable.
-  app.post('/api/payments/demo-pay', async (req, res) => {
+  // Used for demos where the real payment gateway is unavailable. Gated
+  // behind requireAdmin -- this isn't gateway-routed (not reachable from the
+  // app), but payment-service is its own public Render service, so without
+  // this anyone who found the URL could mark any booking "paid" for free.
+  app.post('/api/payments/demo-pay', requireAdmin, async (req, res) => {
     try {
       const { bookingId, amount, payerEmail } = req.body;
 
@@ -117,32 +171,7 @@ export function createApp() {
       };
 
       const transaction = await saveTransaction(fakePayment);
-
-      // Confirm the booking in booking-service
-      const headers = { 'Content-Type': 'application/json' };
-      if (config.bookingServiceAuthToken) {
-        headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
-      }
-
-      try {
-        const confirmResponse = await fetch(
-          `${config.bookingServiceUrl}/bookings/${bookingId}/confirm`,
-          {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ payment_id: paymentId }),
-          }
-        );
-
-        if (!confirmResponse.ok) {
-          const errorText = await confirmResponse.text();
-          console.error(`[Demo Pay] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
-        } else {
-          console.log(`[Demo Pay] Booking ${bookingId} confirmed with payment ${paymentId}`);
-        }
-      } catch (confirmError) {
-        console.error('[Demo Pay] Error confirming booking:', confirmError.message);
-      }
+      await confirmBookingIfApproved(fakePayment);
 
       return res.status(201).json({
         paymentId,
@@ -265,37 +294,10 @@ export function createApp() {
       // Guardar la transacción independientemente del estado
       const transaction = await saveTransaction(payment);
 
-      // Cuando el pago es aprobado, confirmar la reserva en booking-service.
       // El booking_id viaja en el external_reference (UUID que payment-service
       // genera en /create-preference y que la app adjunta al crear la preferencia).
       const bookingId = payment.external_reference || transaction.external_reference;
-
-      if (paymentStatus === 'approved' && bookingId) {
-        const headers = { 'Content-Type': 'application/json' };
-        if (config.bookingServiceAuthToken) {
-          headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
-        }
-
-        try {
-          const confirmResponse = await fetch(
-            `${config.bookingServiceUrl}/bookings/${bookingId}/confirm`,
-            {
-              method: 'POST',
-              headers,
-              body: JSON.stringify({ payment_id: String(payment.id) }),
-            }
-          );
-
-          if (!confirmResponse.ok) {
-            const errorText = await confirmResponse.text();
-            console.error(`[Payment Webhook] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
-          } else {
-            console.log(`[Payment Webhook] Booking ${bookingId} confirmed with payment ${payment.id}`);
-          }
-        } catch (confirmError) {
-          console.error('[Payment Webhook] Error confirming booking:', confirmError.message);
-        }
-      }
+      await confirmBookingIfApproved(payment);
 
       return res.status(200).json({
         message: 'Webhook processed successfully',
@@ -393,6 +395,24 @@ export function createApp() {
         }
       }
 
+      // Mobile's polling loop (pending.tsx) only ever has the bookingId
+      // (externalReference), never MP's own paymentId -- it doesn't exist
+      // yet on the client. Without this, verify-status could only find
+      // anything once the webhook had already saved a transaction, which
+      // never happens without a public WEBHOOK_BASE_URL (e.g. no ngrok in
+      // local dev) -- the poll would 404 every time and time out at
+      // "unknown" even though the payment actually went through on MP.
+      if (!payment && !transaction && externalReference) {
+        try {
+          payment = await searchPaymentByExternalReference(externalReference);
+          if (payment) {
+            transaction = await saveTransaction(payment);
+          }
+        } catch (error) {
+          console.log(`[Payment Verify] Search by externalReference ${externalReference} failed:`, error.message);
+        }
+      }
+
       if (!transaction && !payment) {
         return res.status(404).json({
           message: 'Payment not found',
@@ -405,6 +425,15 @@ export function createApp() {
       if (payment && !transaction) {
         transaction = await saveTransaction(payment);
       }
+
+      // This is the other half of not depending on the webhook: whichever
+      // path found the payment above (DB, direct get, or the search
+      // fallback), make sure the booking actually gets confirmed here too --
+      // otherwise the client would see "approved" while the booking itself
+      // stays PENDING_PAYMENT forever. Safe to call unconditionally: it's a
+      // no-op if payment isn't approved, and a no-op if some other path
+      // already confirmed this same booking.
+      await confirmBookingIfApproved(payment);
 
       // Verificar si necesita reconciliación
       const currentStatus = payment?.status || transaction.status;
@@ -427,7 +456,9 @@ export function createApp() {
     }
   });
 
-  app.post('/internal/refund', async (req, res) => {
+  // Same reasoning as demo-pay above: no gateway route, but publicly
+  // reachable on payment-service's own Render URL, so it needs its own auth.
+  app.post('/internal/refund', requireAdmin, async (req, res) => {
     try {
       const { order_id } = req.body;
 

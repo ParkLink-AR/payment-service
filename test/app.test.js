@@ -17,7 +17,8 @@ jest.unstable_mockModule('../src/db.js', () => ({
 jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   createCheckoutPreference: jest.fn(),
   generateExternalReference: jest.fn(),
-  getPaymentById: jest.fn()
+  getPaymentById: jest.fn(),
+  searchPaymentByExternalReference: jest.fn()
 }));
 
 const {
@@ -33,7 +34,8 @@ const {
 const {
   createCheckoutPreference,
   generateExternalReference,
-  getPaymentById
+  getPaymentById,
+  searchPaymentByExternalReference
 } = await import('../src/mercadoPago.js');
 
 const { createApp } = await import('../src/app.js');
@@ -238,6 +240,33 @@ describe('Payment Service App', () => {
       const res = await request(app).post('/api/payments/verify-status').send({ paymentId: '123' });
       expect(res.status).toBe(404);
     });
+
+    it('falls back to searching MP by externalReference when nothing is in the DB (no webhook)', async () => {
+      getTransactionByExternalReference.mockResolvedValueOnce(null);
+      searchPaymentByExternalReference.mockResolvedValueOnce({
+        id: 'mp-1', status: 'approved', external_reference: 'booking-1',
+      });
+      saveTransaction.mockResolvedValueOnce({ status: 'approved', external_reference: 'booking-1' });
+      global.fetch = jest.fn().mockResolvedValueOnce({ ok: true });
+
+      const res = await request(app).post('/api/payments/verify-status').send({ externalReference: 'booking-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.currentStatus).toBe('approved');
+      expect(searchPaymentByExternalReference).toHaveBeenCalledWith('booking-1');
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/bookings/booking-1/confirm'),
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+
+    it('returns 404 when the MP search fallback also finds nothing', async () => {
+      getTransactionByExternalReference.mockResolvedValueOnce(null);
+      searchPaymentByExternalReference.mockResolvedValueOnce(null);
+
+      const res = await request(app).post('/api/payments/verify-status').send({ externalReference: 'booking-2' });
+      expect(res.status).toBe(404);
+    });
   });
 
   describe('GET /api/payments/metrics', () => {
@@ -265,6 +294,58 @@ describe('Payment Service App', () => {
       getTotalTransactionAmount.mockRejectedValueOnce(new Error('DB error'));
       const res = await request(app).get('/api/payments/metrics').set('Authorization', `Bearer ${adminToken}`);
       expect(res.status).toBe(500);
+    });
+  });
+
+  describe('POST /api/payments/demo-pay', () => {
+    let adminToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+    });
+
+    it('requires an admin token', async () => {
+      const res = await request(app).post('/api/payments/demo-pay').send({ bookingId: 'b1' });
+      expect(res.status).toBe(401);
+      expect(saveTransaction).not.toHaveBeenCalled();
+    });
+
+    it('marks the booking as paid for an admin', async () => {
+      global.fetch = jest.fn().mockResolvedValueOnce({ ok: true });
+      saveTransaction.mockResolvedValueOnce({ id: 'tx1' });
+
+      const res = await request(app)
+        .post('/api/payments/demo-pay')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bookingId: 'b1', amount: 1000 });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('approved');
+      expect(saveTransaction).toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /internal/refund', () => {
+    let adminToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+    });
+
+    it('requires an admin token', async () => {
+      const res = await request(app).post('/internal/refund').send({ order_id: 1 });
+      expect(res.status).toBe(401);
+      expect(markTransactionAsRefunded).not.toHaveBeenCalled();
+    });
+
+    it('refunds for an admin', async () => {
+      markTransactionAsRefunded.mockResolvedValueOnce();
+      const res = await request(app)
+        .post('/internal/refund')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ order_id: 1 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true });
     });
   });
 });
