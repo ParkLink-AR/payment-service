@@ -278,10 +278,14 @@ export function createApp() {
 
   app.post('/api/payments/webhook', async (req, res) => {
     try {
-      const verification = verifyMercadoPagoWebhookSignature(req);
-      if (!verification.ok) {
-        console.warn(`[Payment Webhook] Signature verification failed: ${verification.reason}`);
-        return res.status(403).json({ message: 'Forbidden' });
+      if (config.skipWebhookSignature) {
+        console.warn('[Payment Webhook] signature check skipped (MP_SKIP_WEBHOOK_SIGNATURE=true)');
+      } else {
+        const verification = verifyMercadoPagoWebhookSignature(req);
+        if (!verification.ok) {
+          console.warn(`[Payment Webhook] Signature verification failed: ${verification.reason}`);
+          return res.status(403).json({ message: 'Forbidden' });
+        }
       }
 
       const topic = req.query.topic || req.query.type || req.body?.type;
