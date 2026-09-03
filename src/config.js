@@ -47,8 +47,16 @@ export const config = {
   bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
   bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
   mercadoPagoWebhookSecret: webhookSecret,
+  // Local/dev escape hatch: skip HMAC verification of the Mercado Pago webhook.
+  // Useful when tunnelling the webhook to a laptop and the secret/signature
+  // don't line up. NEVER set this in a real deployment.
+  skipWebhookSignature: process.env.MP_SKIP_WEBHOOK_SIGNATURE === 'true',
   // admin-dashboard fetches /api/payments/metrics directly (not through the
   // gateway), so this service needs its own CORS allowlist. Same default as
   // gateway's own CORS_ORIGINS -- tighten in production via env.
   corsOrigins: process.env.CORS_ORIGINS || '*',
 };
+
+if (config.skipWebhookSignature) {
+  console.warn('[Config] MP_SKIP_WEBHOOK_SIGNATURE=true — Mercado Pago webhook signature verification is DISABLED. Dev only.');
+}
