@@ -143,3 +143,17 @@ export async function markTransactionAsRefunded(orderId) {
     [orderId]
   );
 }
+
+export async function markTransactionAsRefundedByPaymentId(paymentId) {
+  await pool.query(
+    `
+    UPDATE transactions
+    SET
+      status = 'refunded',
+      updated_at = NOW()
+    WHERE payment_id = $1
+      AND status = 'approved'
+    `,
+    [String(paymentId)]
+  );
+}

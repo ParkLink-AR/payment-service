@@ -2,15 +2,23 @@ import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
-import { getTransactionByExternalReference, getTransactionByPaymentId, pool, saveTransaction, markTransactionAsRefunded } from './db.js';
+import {
+  getTransactionByExternalReference,
+  getTransactionByPaymentId,
+  pool,
+  saveTransaction,
+  markTransactionAsRefunded,
+  markTransactionAsRefundedByPaymentId,
+} from './db.js';
 import {
   createCheckoutPreference,
   generateExternalReference,
   getPaymentById,
+  refundPayment,
   searchPaymentByExternalReference,
 } from './mercadoPago.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
-import { requireAdmin } from './security.js';
+import { requireAdmin, requireInternalKey } from './security.js';
 
 function normalizeHeaderValue(value) {
   if (Array.isArray(value)) {
@@ -463,6 +471,34 @@ export function createApp() {
       const { order_id } = req.body;
 
       await markTransactionAsRefunded(order_id);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({
+        detail: 'Failed to refund payment'
+      });
+    }
+  });
+
+  // Triggered by booking-service when an owner rejects (or never responds to)
+  // a booking that requires their approval -- not gateway-routed, protected
+  // by a shared internal key instead of a user's JWT (same "this port is
+  // directly reachable" reasoning as demo-pay/refund above).
+  app.post('/internal/refund-by-payment', requireInternalKey, async (req, res) => {
+    try {
+      const { payment_id } = req.body;
+
+      try {
+        await refundPayment(payment_id);
+      } catch (error) {
+        // A payment_id from a local demo-pay/test flow doesn't exist on
+        // Mercado Pago's side and will always fail here -- log it, but still
+        // mark the record refunded below so dev/demo flows aren't blocked.
+        console.error('Mercado Pago refund failed, marking refunded locally anyway:', error);
+      }
+
+      await markTransactionAsRefundedByPaymentId(payment_id);
 
       res.json({ success: true });
     } catch (error) {

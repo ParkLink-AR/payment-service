@@ -1,5 +1,12 @@
+import { createRequire } from 'module';
 import { MercadoPagoConfig, Payment, Preference } from 'mercadopago';
 import { config } from './config.js';
+
+// PaymentRefund isn't picked up by ESM named-export interop for this CJS
+// package (unlike the classes above) -- inconsistently so between plain
+// Node and Jest's --experimental-vm-modules. A plain require() sidesteps
+// that static-analysis interop entirely.
+const { PaymentRefund } = createRequire(import.meta.url)('mercadopago');
 
 const client = new MercadoPagoConfig({
   accessToken: config.mercadoPagoAccessToken,
@@ -8,6 +15,7 @@ const client = new MercadoPagoConfig({
 
 const preferenceClient = new Preference(client);
 const paymentClient = new Payment(client);
+const refundClient = new PaymentRefund(client);
 
 export async function createCheckoutPreference({
   amount,
@@ -124,5 +132,17 @@ export async function getPaymentById(paymentId) {
     };
   }
   return paymentClient.get({ id: idStr });
+}
+
+// Full refund via Mercado Pago's real API. Payment ids created by demo-pay
+// (see getPaymentById above) start with "mock-" and don't exist on Mercado
+// Pago's side, so calling refund on them would always fail -- the caller
+// (app.js) treats that as a no-op success instead of an error.
+export async function refundPayment(paymentId) {
+  const idStr = String(paymentId);
+  if (idStr.startsWith('mock-')) {
+    return { id: idStr, status: 'refunded', mocked: true };
+  }
+  return refundClient.create({ payment_id: idStr });
 }
 

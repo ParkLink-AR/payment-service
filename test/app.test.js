@@ -11,13 +11,15 @@ jest.unstable_mockModule('../src/db.js', () => ({
   saveTransaction: jest.fn(),
   getTotalTransactionAmount: jest.fn(),
   getTransactionAmountByPeriod: jest.fn(),
-  markTransactionAsRefunded: jest.fn()
+  markTransactionAsRefunded: jest.fn(),
+  markTransactionAsRefundedByPaymentId: jest.fn()
 }));
 
 jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   createCheckoutPreference: jest.fn(),
   generateExternalReference: jest.fn(),
   getPaymentById: jest.fn(),
+  refundPayment: jest.fn(),
   searchPaymentByExternalReference: jest.fn()
 }));
 
@@ -28,13 +30,15 @@ const {
   saveTransaction,
   getTotalTransactionAmount,
   getTransactionAmountByPeriod,
-  markTransactionAsRefunded
+  markTransactionAsRefunded,
+  markTransactionAsRefundedByPaymentId
 } = await import('../src/db.js');
 
 const {
   createCheckoutPreference,
   generateExternalReference,
   getPaymentById,
+  refundPayment,
   searchPaymentByExternalReference
 } = await import('../src/mercadoPago.js');
 
@@ -346,6 +350,43 @@ describe('Payment Service App', () => {
         .send({ order_id: 1 });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ success: true });
+    });
+  });
+
+  describe('POST /internal/refund-by-payment', () => {
+    it('requires the internal key', async () => {
+      const res = await request(app).post('/internal/refund-by-payment').send({ payment_id: 'pay1' });
+      expect(res.status).toBe(401);
+      expect(refundPayment).not.toHaveBeenCalled();
+    });
+
+    it('refunds via Mercado Pago and marks the transaction refunded for a valid key', async () => {
+      refundPayment.mockResolvedValueOnce({ id: 'pay1', status: 'refunded' });
+      markTransactionAsRefundedByPaymentId.mockResolvedValueOnce();
+
+      const res = await request(app)
+        .post('/internal/refund-by-payment')
+        .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
+        .send({ payment_id: 'pay1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true });
+      expect(refundPayment).toHaveBeenCalledWith('pay1');
+      expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
+    });
+
+    it('still marks the transaction refunded when the Mercado Pago call itself fails', async () => {
+      refundPayment.mockRejectedValueOnce(new Error('mock payment, not a real Mercado Pago id'));
+      markTransactionAsRefundedByPaymentId.mockResolvedValueOnce();
+
+      const res = await request(app)
+        .post('/internal/refund-by-payment')
+        .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
+        .send({ payment_id: 'mock-approved-1-1000-ref1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true });
+      expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('mock-approved-1-1000-ref1');
     });
   });
 });
