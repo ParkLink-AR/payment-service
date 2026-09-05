@@ -16,6 +16,23 @@ for (const key of requiredEnv) {
   }
 }
 
+const isProd = (process.env.ENVIRONMENT || process.env.NODE_ENV) === 'production';
+const insecureSubstrings = ['dev-secret', 'change-me', 'reemplazar', 'secret123', 'password', '123456'];
+
+if (isProd) {
+  const jwtSec = (process.env.JWT_SECRET || '').toLowerCase();
+  if (jwtSec.length < 32 || insecureSubstrings.some((s) => jwtSec.includes(s))) {
+    throw new Error('FATAL: Insecure or default JWT_SECRET configured in production environment.');
+  }
+  const intKey = (process.env.INTERNAL_SERVICE_KEY || '').toLowerCase();
+  if (intKey.length < 32 || insecureSubstrings.some((s) => intKey.includes(s))) {
+    throw new Error('FATAL: Insecure or default INTERNAL_SERVICE_KEY configured in production environment.');
+  }
+  if (process.env.MP_SKIP_WEBHOOK_SIGNATURE === 'true') {
+    throw new Error('FATAL: MP_SKIP_WEBHOOK_SIGNATURE cannot be true in production.');
+  }
+}
+
 // MercadoPago credentials are optional when running in demo mode
 if (!webhookSecret) {
   console.warn('[Config] MERCADOPAGO_WEBHOOK_SECRET not set — MercadoPago webhook verification disabled (demo mode).');
