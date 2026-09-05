@@ -41,3 +41,18 @@ export function requireInternalKey(req, res, next) {
   }
   next();
 }
+
+// Optional validation to ensure requests coming through gateway carry valid gateway secret
+export function requireGatewaySecret(req, res, next) {
+  const gatewaySecret = process.env.GATEWAY_INTERNAL_SECRET;
+  if (!gatewaySecret) {
+    return next(); // If not configured, pass through (e.g. dev mode)
+  }
+  const provided = Buffer.from(String(req.headers['x-gateway-secret'] || ''));
+  const expected = Buffer.from(String(gatewaySecret));
+
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    return res.status(403).json({ detail: 'Forbidden: request must originate from Gateway' });
+  }
+  next();
+}
