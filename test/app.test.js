@@ -342,6 +342,24 @@ describe('Payment Service App', () => {
       expect(markTransactionAsRefunded).not.toHaveBeenCalled();
     });
 
+    it('rejects non-admin token', async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      const userToken = jwt.sign({ role: 'user' }, process.env.JWT_SECRET);
+      const res = await request(app)
+        .post('/internal/refund')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ order_id: 1 });
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects invalid signature token', async () => {
+      const res = await request(app)
+        .post('/internal/refund')
+        .set('Authorization', 'Bearer invalid.token.value')
+        .send({ order_id: 1 });
+      expect(res.status).toBe(401);
+    });
+
     it('refunds for an admin', async () => {
       markTransactionAsRefunded.mockResolvedValueOnce();
       const res = await request(app)
