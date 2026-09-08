@@ -28,6 +28,10 @@ if (isProd) {
   if (intKey.length < 32 || insecureSubstrings.some((s) => intKey.includes(s))) {
     throw new Error('FATAL: Insecure or default INTERNAL_SERVICE_KEY configured in production environment.');
   }
+  const gatewaySecret = (process.env.GATEWAY_INTERNAL_SECRET || '').toLowerCase();
+  if (gatewaySecret.length < 32 || insecureSubstrings.some((s) => gatewaySecret.includes(s))) {
+    throw new Error('FATAL: Insecure or missing GATEWAY_INTERNAL_SECRET configured in production environment.');
+  }
   if (process.env.MP_SKIP_WEBHOOK_SIGNATURE === 'true') {
     throw new Error('FATAL: MP_SKIP_WEBHOOK_SIGNATURE cannot be true in production.');
   }

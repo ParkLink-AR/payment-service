@@ -18,7 +18,7 @@ import {
   searchPaymentByExternalReference,
 } from './mercadoPago.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
-import { requireAdmin, requireInternalKey } from './security.js';
+import { requireAdmin, requireInternalKey, requireGatewaySecret } from './security.js';
 
 function normalizeHeaderValue(value) {
   if (Array.isArray(value)) {
@@ -193,7 +193,7 @@ export function createApp() {
     }
   });
 
-  app.post('/api/payments/create-preference', async (req, res) => {
+  app.post('/api/payments/create-preference', requireGatewaySecret, async (req, res) => {
     try {
       // Log token for debugging
       const authHeader = req.headers.authorization;
@@ -342,7 +342,7 @@ export function createApp() {
 
 
 
-  app.get('/api/payments/:paymentId', async (req, res) => {
+  app.get('/api/payments/:paymentId', requireGatewaySecret, async (req, res) => {
     try {
       const transaction = await getTransactionByPaymentId(req.params.paymentId);
       if (!transaction) {
@@ -355,7 +355,7 @@ export function createApp() {
     }
   });
 
-  app.get('/api/payments/external-reference/:externalReference', async (req, res) => {
+  app.get('/api/payments/external-reference/:externalReference', requireGatewaySecret, async (req, res) => {
     try {
       const transaction = await getTransactionByExternalReference(req.params.externalReference);
       if (!transaction) {
@@ -368,7 +368,7 @@ export function createApp() {
     }
   });
 
-  app.post('/api/payments/verify-status', async (req, res) => {
+  app.post('/api/payments/verify-status', requireGatewaySecret, async (req, res) => {
     try {
       const { externalReference, paymentId } = req.body;
 
