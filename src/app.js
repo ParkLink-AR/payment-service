@@ -142,6 +142,40 @@ export function createApp() {
   );
   app.use(express.json());
 
+  // Mercado Pago's hosted checkout only auto-redirects (auto_return) to a real
+  // https:// URL, never to a custom app scheme like parklink:// -- so
+  // create-preference points back_urls here instead of straight at the app's
+  // deep link (see the auto_return check in mercadoPago.js). This bridge page
+  // just bounces the browser to parklink://payment/pending, which is the only
+  // screen that actually verifies the payment with us before showing a final
+  // state -- so it's the target for every outcome, not just success, instead
+  // of trusting Mercado Pago's own redirect status at face value.
+  app.get('/payment-return', (req, res) => {
+    const bookingId = req.query['external_reference'];
+    console.log('[Payment Return] Mercado Pago redirected back:', {
+      status: req.query.status,
+      collectionStatus: req.query.collection_status,
+      bookingId,
+    });
+
+    const deepLink = `parklink://payment/pending${bookingId ? `?bookingId=${encodeURIComponent(String(bookingId))}` : ''}`;
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="0;url=${deepLink}" />
+    <title>ParkLink</title>
+  </head>
+  <body style="font-family:sans-serif;text-align:center;padding-top:48px;">
+    <p>Volviendo a ParkLink...</p>
+    <a href="${deepLink}">Tocá acá si no volvés automáticamente</a>
+    <script>location.replace(${JSON.stringify(deepLink)});</script>
+  </body>
+</html>`);
+  });
+
   app.get('/health', async (_req, res) => {
     try {
       await pool.query('SELECT 1');
@@ -222,14 +256,16 @@ export function createApp() {
       const payerEmail = forcedPayerEmail || req.body?.payerEmail || undefined;
       const externalReference = req.body?.externalReference || crypto.randomUUID();
 
-      const backUrls =
-        config.frontendSuccessUrl || config.frontendFailureUrl || config.frontendPendingUrl
-          ? {
-              success: config.frontendSuccessUrl || undefined,
-              failure: config.frontendFailureUrl || undefined,
-              pending: config.frontendPendingUrl || undefined,
-            }
-          : undefined;
+      // See the /payment-return handler above for why this points here
+      // instead of directly at the app's parklink:// deep link.
+      const paymentReturnBase = (config.appBaseUrl || '').replace(/\/+$/, '');
+      const backUrls = paymentReturnBase
+        ? {
+            success: `${paymentReturnBase}/payment-return?status=success`,
+            failure: `${paymentReturnBase}/payment-return?status=failure`,
+            pending: `${paymentReturnBase}/payment-return?status=pending`,
+          }
+        : undefined;
 
       console.log('[Payment Service] Creating preference with backUrls:', backUrls);
       if (forcedPayerEmail) {

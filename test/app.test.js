@@ -59,6 +59,27 @@ describe('Payment Service App', () => {
     jest.clearAllMocks();
   });
 
+  describe('GET /payment-return', () => {
+    it('redirects to the pending screen with the bookingId, regardless of the status Mercado Pago reports', async () => {
+      const res = await request(app).get('/payment-return').query({
+        status: 'success',
+        external_reference: 'booking-123',
+        collection_status: 'approved',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('parklink://payment/pending?bookingId=booking-123');
+    });
+
+    it('still redirects when there is no bookingId to attach', async () => {
+      const res = await request(app).get('/payment-return').query({ status: 'failure' });
+
+      expect(res.status).toBe(200);
+      expect(res.text).toContain('parklink://payment/pending');
+      expect(res.text).not.toContain('bookingId=');
+    });
+  });
+
   describe('GET /health', () => {
     it('should return 200 ok when db is healthy', async () => {
       pool.query.mockResolvedValueOnce({ rows: [] });
@@ -107,6 +128,25 @@ describe('Payment Service App', () => {
       const res = await request(app).post('/api/payments/create-preference').send({ amount: 100 });
       expect(res.status).toBe(500);
       expect(res.body.message).toBe('Error creating Mercado Pago preference');
+    });
+
+    it('points back_urls at this service\'s own /payment-return bridge, not directly at the app deep link', async () => {
+      createCheckoutPreference.mockResolvedValueOnce({
+        id: 'pref_123',
+        init_point: 'https://mp.com/checkout/123'
+      });
+
+      await request(app).post('/api/payments/create-preference').send({ amount: 100 });
+
+      expect(createCheckoutPreference).toHaveBeenCalledWith(
+        expect.objectContaining({
+          backUrls: {
+            success: 'http://localhost:8004/payment-return?status=success',
+            failure: 'http://localhost:8004/payment-return?status=failure',
+            pending: 'http://localhost:8004/payment-return?status=pending',
+          },
+        }),
+      );
     });
   });
 
