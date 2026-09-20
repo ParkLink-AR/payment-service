@@ -80,5 +80,11 @@ describe('MercadoPago Module', () => {
       expect(result.mocked).toBe(true);
       expect(result.status).toBe('refunded');
     });
+
+    it('should return mocked refund for seed-demo- id', async () => {
+      const result = await mp.refundPayment('seed-demo-fa30af7c-72b6-411d-8214-5ce23bbcf19d');
+      expect(result.mocked).toBe(true);
+      expect(result.status).toBe('refunded');
+    });
   });
 });

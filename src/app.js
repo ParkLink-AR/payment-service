@@ -9,6 +9,7 @@ import {
   saveTransaction,
   markTransactionAsRefunded,
   markTransactionAsRefundedByPaymentId,
+  markTransactionAsRefundFailed,
 } from './db.js';
 import {
   createCheckoutPreference,
@@ -532,10 +533,18 @@ export function createApp() {
       try {
         await refundPayment(payment_id);
       } catch (error) {
-        // A payment_id from a local demo-pay/test flow doesn't exist on
-        // Mercado Pago's side and will always fail here -- log it, but still
-        // mark the record refunded below so dev/demo flows aren't blocked.
-        console.error('Mercado Pago refund failed, marking refunded locally anyway:', error);
+        // refundPayment() already no-ops for known-fake ids (mock-/seed-demo-
+        // prefixes, see mercadoPago.js), so reaching here means a REAL
+        // payment genuinely failed to refund on Mercado Pago's side (e.g.
+        // the account isn't enabled for live money movement) -- marking it
+        // "refunded" anyway would be a lie the app and support team would
+        // trust. Flag it for manual review instead.
+        console.error('[Payment] Mercado Pago refund failed for a real payment, marking refund_failed:', error);
+        await markTransactionAsRefundFailed(payment_id);
+        return res.status(502).json({
+          success: false,
+          detail: 'Mercado Pago refund failed; transaction flagged for manual review',
+        });
       }
 
       await markTransactionAsRefundedByPaymentId(payment_id);

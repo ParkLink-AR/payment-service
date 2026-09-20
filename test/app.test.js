@@ -12,7 +12,8 @@ jest.unstable_mockModule('../src/db.js', () => ({
   getTotalTransactionAmount: jest.fn(),
   getTransactionAmountByPeriod: jest.fn(),
   markTransactionAsRefunded: jest.fn(),
-  markTransactionAsRefundedByPaymentId: jest.fn()
+  markTransactionAsRefundedByPaymentId: jest.fn(),
+  markTransactionAsRefundFailed: jest.fn()
 }));
 
 jest.unstable_mockModule('../src/mercadoPago.js', () => ({
@@ -31,7 +32,8 @@ const {
   getTotalTransactionAmount,
   getTransactionAmountByPeriod,
   markTransactionAsRefunded,
-  markTransactionAsRefundedByPaymentId
+  markTransactionAsRefundedByPaymentId,
+  markTransactionAsRefundFailed
 } = await import('../src/db.js');
 
 const {
@@ -433,18 +435,26 @@ describe('Payment Service App', () => {
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
     });
 
-    it('still marks the transaction refunded when the Mercado Pago call itself fails', async () => {
-      refundPayment.mockRejectedValueOnce(new Error('mock payment, not a real Mercado Pago id'));
-      markTransactionAsRefundedByPaymentId.mockResolvedValueOnce();
+    it('flags the transaction for manual review when a real Mercado Pago refund fails, instead of marking it refunded', async () => {
+      // refundPayment() itself already no-ops for known-fake ids (mock-/
+      // seed-demo- prefixes, see mercadoPago.test.js) -- a rejection
+      // reaching this handler means a real payment genuinely failed to
+      // refund, so it must NOT be reported as success.
+      refundPayment.mockRejectedValueOnce(new Error('Unauthorized use of live credentials'));
+      markTransactionAsRefundFailed.mockResolvedValueOnce();
 
       const res = await request(app)
         .post('/internal/refund-by-payment')
         .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
-        .send({ payment_id: 'mock-approved-1-1000-ref1' });
+        .send({ payment_id: '178591399221' });
 
-      expect(res.status).toBe(200);
-      expect(res.body).toEqual({ success: true });
-      expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('mock-approved-1-1000-ref1');
+      expect(res.status).toBe(502);
+      expect(res.body).toEqual({
+        success: false,
+        detail: 'Mercado Pago refund failed; transaction flagged for manual review',
+      });
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('178591399221');
+      expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
     });
   });
 });

@@ -135,12 +135,13 @@ export async function getPaymentById(paymentId) {
 }
 
 // Full refund via Mercado Pago's real API. Payment ids created by demo-pay
-// (see getPaymentById above) start with "mock-" and don't exist on Mercado
-// Pago's side, so calling refund on them would always fail -- the caller
-// (app.js) treats that as a no-op success instead of an error.
+// (see getPaymentById above, "mock-" prefix) or by hand-seeded test data
+// ("seed-demo-" prefix) don't exist on Mercado Pago's side, so calling
+// refund on them would always fail -- treated as a no-op success instead,
+// so only a genuinely real payment's refund failure reaches app.js's catch.
 export async function refundPayment(paymentId) {
   const idStr = String(paymentId);
-  if (idStr.startsWith('mock-')) {
+  if (idStr.startsWith('mock-') || idStr.startsWith('seed-demo-')) {
     return { id: idStr, status: 'refunded', mocked: true };
   }
   return refundClient.create({ payment_id: idStr });

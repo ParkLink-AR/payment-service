@@ -157,3 +157,19 @@ export async function markTransactionAsRefundedByPaymentId(paymentId) {
     [String(paymentId)]
   );
 }
+
+// A real Mercado Pago refund call failed (see /internal/refund-by-payment) --
+// distinct from 'refunded' so the transaction shows up as needing manual
+// follow-up instead of silently looking like the money went back.
+export async function markTransactionAsRefundFailed(paymentId) {
+  await pool.query(
+    `
+    UPDATE transactions
+    SET
+      status = 'refund_failed',
+      updated_at = NOW()
+    WHERE payment_id = $1
+    `,
+    [String(paymentId)]
+  );
+}
