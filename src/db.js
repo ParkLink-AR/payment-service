@@ -25,6 +25,11 @@ export async function initDatabase() {
 
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS order_id BIGINT;
 
+    -- How many times the refund retry job (see refundRetryJob.js) has tried and failed to
+    -- refund this transaction with Mercado Pago -- caps retries so a permanently
+    -- unrefundable payment (e.g. wrong payment method) doesn't get hammered forever.
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_attempts INT NOT NULL DEFAULT 0;
+
     CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
     CREATE INDEX IF NOT EXISTS idx_transactions_external_reference ON transactions(external_reference);
     CREATE INDEX IF NOT EXISTS idx_transactions_order_id ON transactions(order_id);
@@ -158,18 +163,37 @@ export async function markTransactionAsRefundedByPaymentId(paymentId) {
   );
 }
 
-// A real Mercado Pago refund call failed (see /internal/refund-by-payment) --
-// distinct from 'refunded' so the transaction shows up as needing manual
-// follow-up instead of silently looking like the money went back.
+// A real Mercado Pago refund call failed (see /internal/refund-by-payment, and
+// refundRetryJob.js's own retries) -- distinct from 'refunded' so the transaction shows
+// up as needing manual follow-up instead of silently looking like the money went back.
+// Bumps refund_attempts every time this is called, first failure included, so the retry
+// job's cutoff (config.refundRetryMaxAttempts) counts every attempt, not just its own.
 export async function markTransactionAsRefundFailed(paymentId) {
   await pool.query(
     `
     UPDATE transactions
     SET
       status = 'refund_failed',
+      refund_attempts = refund_attempts + 1,
       updated_at = NOW()
     WHERE payment_id = $1
     `,
     [String(paymentId)]
   );
+}
+
+// Transactions still owing a refund, oldest-failed-first, that haven't already exhausted
+// the retry budget -- what refundRetryJob.js works through on each tick.
+export async function listRefundFailedTransactions(maxAttempts) {
+  const result = await pool.query(
+    `
+    SELECT payment_id, refund_attempts
+    FROM transactions
+    WHERE status = 'refund_failed'
+      AND refund_attempts < $1
+    ORDER BY updated_at ASC
+    `,
+    [maxAttempts]
+  );
+  return result.rows;
 }

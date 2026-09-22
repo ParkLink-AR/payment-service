@@ -64,6 +64,11 @@ export const config = {
   defaultCurrency: process.env.DEFAULT_CURRENCY || 'ARS',
   bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
   bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
+  // How often the background job re-attempts a refund that previously failed against
+  // Mercado Pago (see refundRetryJob.js), and how many times it'll retry a given
+  // transaction before leaving it for manual review for good.
+  refundRetryIntervalMinutes: Number(process.env.REFUND_RETRY_INTERVAL_MINUTES || 30),
+  refundRetryMaxAttempts: Number(process.env.REFUND_RETRY_MAX_ATTEMPTS || 5),
   mercadoPagoWebhookSecret: webhookSecret,
   // Local/dev escape hatch: skip HMAC verification of the Mercado Pago webhook.
   // Useful when tunnelling the webhook to a laptop and the secret/signature

@@ -1,6 +1,7 @@
 import { createApp } from './app.js';
 import { config } from './config.js';
 import { initDatabase } from './db.js';
+import { startRefundRetryJob } from './refundRetryJob.js';
 
 async function bootstrap() {
   await initDatabase();
@@ -9,6 +10,10 @@ async function bootstrap() {
   app.listen(config.port, () => {
     console.log(`payment-service listening on port ${config.port}`);
   });
+
+  // Background job: retry refunds that previously failed against Mercado Pago instead of
+  // leaving them stuck on "needs manual review" forever.
+  startRefundRetryJob();
 }
 
 bootstrap().catch((error) => {
