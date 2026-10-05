@@ -46,7 +46,10 @@ jobs:
       run: npm run test
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
+      # A Codecov outage or TLS hiccup must never fail CI -- fail_ci_if_error alone doesn't
+      # cover errors the action hits before uploading (e.g. fetching its CLI).
+      continue-on-error: true
       with:
         directory: ./coverage/
         token: ${{ secrets.CODECOV_TOKEN }}
