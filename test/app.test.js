@@ -302,7 +302,10 @@ describe('Payment Service App', () => {
       expect(searchPaymentByExternalReference).toHaveBeenCalledWith('booking-1');
       expect(global.fetch).toHaveBeenCalledWith(
         expect.stringContaining('/bookings/booking-1/confirm'),
-        expect.objectContaining({ method: 'POST' }),
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({ 'X-Internal-Key': process.env.INTERNAL_SERVICE_KEY }),
+        }),
       );
     });
 

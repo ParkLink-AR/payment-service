@@ -111,10 +111,12 @@ async function confirmBookingIfApproved(payment) {
     return;
   }
 
-  const headers = { 'Content-Type': 'application/json' };
-  if (config.bookingServiceAuthToken) {
-    headers.Authorization = `Bearer ${config.bookingServiceAuthToken}`;
-  }
+  // booking-service only accepts /bookings/{id}/confirm from this service --
+  // the same shared INTERNAL_SERVICE_KEY it uses to call our /internal/* routes.
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Internal-Key': config.internalServiceKey,
+  };
 
   try {
     const confirmResponse = await fetch(`${config.bookingServiceUrl}/bookings/${bookingId}/confirm`, {

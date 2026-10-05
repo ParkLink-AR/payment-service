@@ -63,7 +63,7 @@ export const config = {
   webhookBaseUrl: process.env.WEBHOOK_BASE_URL || process.env.APP_BASE_URL || 'http://localhost:8004',
   defaultCurrency: process.env.DEFAULT_CURRENCY || 'ARS',
   bookingServiceUrl: process.env.BOOKING_SERVICE_URL || 'http://localhost:8080',
-  bookingServiceAuthToken: process.env.BOOKING_SERVICE_AUTH_TOKEN || '',
+  internalServiceKey: process.env.INTERNAL_SERVICE_KEY || '',
   // How often the background job re-attempts a refund that previously failed against
   // Mercado Pago (see refundRetryJob.js), and how many times it'll retry a given
   // transaction before leaving it for manual review for good.
