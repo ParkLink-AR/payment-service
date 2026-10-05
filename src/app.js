@@ -3,21 +3,21 @@ import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
 import {
+  claimTransactionForRefund,
   getTransactionByExternalReference,
   getTransactionByPaymentId,
   pool,
   saveTransaction,
-  markTransactionAsRefunded,
   markTransactionAsRefundedByPaymentId,
   markTransactionAsRefundFailed,
 } from './db.js';
 import {
   createCheckoutPreference,
-  generateExternalReference,
   getPaymentById,
   refundPayment,
   searchPaymentByExternalReference,
 } from './mercadoPago.js';
+import { confirmBooking, getBooking } from './bookingClient.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
 import { requireAdmin, requireInternalKey, requireGatewaySecret } from './security.js';
 
@@ -94,13 +94,34 @@ function verifyMercadoPagoWebhookSignature(req) {
   return { ok: true };
 }
 
-// Confirms the booking in booking-service once its payment is approved.
-// The bookingId travels as the payment's external_reference (set by the app
-// in /create-preference). Shared by the webhook handler, demo-pay, and
-// verify-status's polling fallback -- ConfirmBooking on booking-service's
-// side only updates rows still PENDING_PAYMENT, so calling this more than
-// once for the same booking (e.g. webhook *and* a poll both catching the
-// same approval) is a harmless no-op the second time.
+// booking-service error codes for an approved payment that can't pay for its booking
+// (it arrived after the hold expired, charged the wrong amount, or the booking was
+// already paid / isn't awaiting payment). The money moved, so it goes straight back.
+const REFUNDABLE_CONFIRM_ERRORS = new Set(['HOLD_EXPIRED', 'AMOUNT_MISMATCH', 'BOOKING_NOT_PAYABLE']);
+
+// Refunds an approved payment that has no booking to pay for. Claimed atomically first
+// (see claimTransactionForRefund) so the webhook and the app's polling can't both refund
+// it; a Mercado Pago failure is flagged refund_failed for refundRetryJob.js to retry.
+async function refundUnbookablePayment(paymentId, reason) {
+  if (!(await claimTransactionForRefund(paymentId))) {
+    return;
+  }
+  try {
+    await refundPayment(paymentId);
+    await markTransactionAsRefundedByPaymentId(paymentId);
+    console.warn(`[Payment] Refunded payment ${paymentId}: booking refused it (${reason})`);
+  } catch (error) {
+    console.error(`[Payment] Automatic refund of payment ${paymentId} failed, flagged for retry:`, error);
+    await markTransactionAsRefundFailed(paymentId);
+  }
+}
+
+// Confirms the booking in booking-service once its payment is approved. The bookingId
+// travels as the payment's external_reference (set in /create-preference). Shared by the
+// webhook handler, demo-pay, and verify-status's polling fallback -- booking-service's
+// confirm is idempotent for the same payment, so calling this more than once for the
+// same approval (webhook *and* a poll) is harmless. If booking-service refuses the payment
+// outright, it's refunded.
 async function confirmBookingIfApproved(payment) {
   if (!payment || payment.status !== 'approved') {
     return;
@@ -111,29 +132,42 @@ async function confirmBookingIfApproved(payment) {
     return;
   }
 
-  // booking-service only accepts /bookings/{id}/confirm from this service --
-  // the same shared INTERNAL_SERVICE_KEY it uses to call our /internal/* routes.
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-Internal-Key': config.internalServiceKey,
-  };
-
   try {
-    const confirmResponse = await fetch(`${config.bookingServiceUrl}/bookings/${bookingId}/confirm`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ payment_id: String(payment.id) }),
-    });
-
-    if (!confirmResponse.ok) {
-      const errorText = await confirmResponse.text();
-      console.error(`[Payment] Booking confirmation failed: ${confirmResponse.status} - ${errorText}`);
-    } else {
+    const amountCentavos = Math.round(Number(payment.transaction_amount || 0) * 100);
+    const result = await confirmBooking(bookingId, payment.id, amountCentavos);
+    if (result.ok) {
       console.log(`[Payment] Booking ${bookingId} confirmed with payment ${payment.id}`);
+      return;
     }
+    if (result.status === 400 && REFUNDABLE_CONFIRM_ERRORS.has(result.code)) {
+      await refundUnbookablePayment(payment.id, result.code);
+      return;
+    }
+    console.error(`[Payment] Booking confirmation failed: ${result.status} ${result.code ?? ''}`);
   } catch (confirmError) {
     console.error('[Payment] Error confirming booking:', confirmError.message);
   }
+}
+
+// The authenticated caller (set by the gateway) may act on bookingId's payment only if it's
+// their own booking. Resolves to the booking, or sends the error response and resolves to
+// null.
+async function loadOwnBooking(req, res, bookingId) {
+  if (!bookingId) {
+    res.status(400).json({ message: 'externalReference is required' });
+    return null;
+  }
+  const booking = await getBooking(bookingId);
+  if (!booking) {
+    res.status(404).json({ message: 'Booking not found' });
+    return null;
+  }
+  const callerId = req.headers['x-user-id'];
+  if (!callerId || callerId !== booking.user_id) {
+    res.status(403).json({ message: 'Not your booking' });
+    return null;
+  }
+  return booking;
 }
 
 export function createApp() {
@@ -184,7 +218,8 @@ export function createApp() {
       await pool.query('SELECT 1');
       res.json({ status: 'ok' });
     } catch (error) {
-      res.status(500).json({ status: 'error', message: error.message });
+      console.error('[Payment Service] Health check failed:', error);
+      res.status(500).json({ status: 'error' });
     }
   });
 
@@ -196,17 +231,21 @@ export function createApp() {
   // this anyone who found the URL could mark any booking "paid" for free.
   app.post('/api/payments/demo-pay', requireAdmin, async (req, res) => {
     try {
-      const { bookingId, amount, payerEmail } = req.body;
+      const { bookingId, payerEmail } = req.body;
 
       if (!bookingId) {
         return res.status(400).json({ message: 'bookingId is required' });
+      }
+      const booking = await getBooking(bookingId);
+      if (!booking) {
+        return res.status(404).json({ message: 'Booking not found' });
       }
 
       const paymentId = `demo-${crypto.randomUUID()}`;
       const fakePayment = {
         id: paymentId,
         status: 'approved',
-        transaction_amount: Number(amount) || 0,
+        transaction_amount: booking.amount / 100,
         currency_id: 'ARS',
         external_reference: bookingId,
         payer: { email: payerEmail || 'demo@pll.com' },
@@ -226,38 +265,30 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Demo Pay] Error:', error);
-      return res.status(500).json({ message: 'Demo payment error', detail: error.message });
+      return res.status(500).json({ message: 'Demo payment error' });
     }
   });
 
+  // The amount charged is always the booking's own server-side price (from
+  // booking-service), never anything the client sends -- and only the booking's own driver
+  // can open a checkout for it, while its hold is still running.
   app.post('/api/payments/create-preference', requireGatewaySecret, async (req, res) => {
     try {
-      // Log token for debugging
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.substring(7);
-        console.log(`[Payment Service] Token received (last 4 digits): ...${token.slice(-4)}`);
-      } else {
-        console.log('[Payment Service] No token received');
+      const booking = await loadOwnBooking(req, res, req.body?.externalReference);
+      if (!booking) {
+        return;
+      }
+      if (booking.status !== 'PENDING_PAYMENT') {
+        return res.status(409).json({ code: 'BOOKING_NOT_PAYABLE', message: 'Booking is not awaiting payment' });
+      }
+      if (booking.hold_expires_at && new Date(booking.hold_expires_at) <= new Date()) {
+        return res.status(409).json({ code: 'HOLD_EXPIRED', message: 'Booking hold has expired' });
       }
 
-      const amount = Number(req.body?.amount);
-      const orderId = req.body?.orderId ? Number(req.body.orderId) : null;
-      const orderIds = Array.isArray(req.body?.orderIds)
-        ? req.body.orderIds.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value > 0)
-        : [];
-      const items = Array.isArray(req.body?.items) ? req.body.items : [];
-
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ message: 'amount must be a positive number' });
-      }
-
-      const currency = (req.body?.currency || config.defaultCurrency).toUpperCase();
-      const title = req.body?.title || (orderId ? `Orden #${orderId} - Bazaar` : 'Compra Bazaar');
-      const description = req.body?.description || 'Pago de compra';
+      const title = String(req.body?.title || 'Reserva ParkLink').slice(0, 120);
+      const description = String(req.body?.description || 'Reserva de cochera en ParkLink').slice(0, 255);
       const forcedPayerEmail = config.forceTestPayerEmail?.trim();
       const payerEmail = forcedPayerEmail || req.body?.payerEmail || undefined;
-      const externalReference = req.body?.externalReference || crypto.randomUUID();
 
       // See the /payment-return handler above for why this points here
       // instead of directly at the app's parklink:// deep link.
@@ -270,48 +301,26 @@ export function createApp() {
           }
         : undefined;
 
-      console.log('[Payment Service] Creating preference with backUrls:', backUrls);
-      if (forcedPayerEmail) {
-        console.log(`[Payment Service] Using forced payer email from env: ${forcedPayerEmail}`);
-      }
-
       const preference = await createCheckoutPreference({
-        amount,
+        amount: booking.amount / 100,
         title,
         description,
-        currency,
+        currency: config.defaultCurrency,
         payerEmail,
-        externalReference,
-        orderId,
-        orderIds,
-        items,
+        externalReference: booking.id,
         backUrls,
         notificationUrl: `${config.webhookBaseUrl}/api/payments/webhook`,
+        expiresAt: booking.hold_expires_at,
       });
 
       return res.status(201).json({
         preferenceId: preference.id,
         checkoutUrl: preference.init_point,
-        externalReference,
-        orderId,
+        externalReference: booking.id,
       });
     } catch (error) {
-      return res.status(500).json({
-        message: 'Error creating Mercado Pago preference',
-        detail: error.message,
-      });
-    }
-  });
-
-  app.post('/api/payments/external-reference', async (_req, res) => {
-    try {
-      const { externalReference } = await generateExternalReference();
-      return res.status(201).json({ externalReference });
-    } catch (error) {
-      return res.status(500).json({
-        message: 'Error generating external reference',
-        detail: error.message,
-      });
+      console.error('[Payment Service] Error creating preference:', error);
+      return res.status(500).json({ message: 'Error creating Mercado Pago preference' });
     }
   });
 
@@ -358,7 +367,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Webhook] Error processing webhook:', error);
-      return res.status(500).json({ message: 'Webhook processing error', detail: error.message });
+      return res.status(500).json({ message: 'Webhook processing error' });
     }
   });
   
@@ -381,7 +390,9 @@ export function createApp() {
 
 
 
-  app.get('/api/payments/:paymentId', requireGatewaySecret, async (req, res) => {
+  // Staff-only lookups (no ownership check of their own -- a transaction carries the
+  // payer's email), not used by the app itself.
+  app.get('/api/payments/:paymentId', requireAdmin, async (req, res) => {
     try {
       const transaction = await getTransactionByPaymentId(req.params.paymentId);
       if (!transaction) {
@@ -390,11 +401,12 @@ export function createApp() {
 
       return res.json(transaction);
     } catch (error) {
-      return res.status(500).json({ message: 'Error fetching transaction', detail: error.message });
+      console.error('[Payment Service] Error fetching transaction:', error);
+      return res.status(500).json({ message: 'Error fetching transaction' });
     }
   });
 
-  app.get('/api/payments/external-reference/:externalReference', requireGatewaySecret, async (req, res) => {
+  app.get('/api/payments/external-reference/:externalReference', requireAdmin, async (req, res) => {
     try {
       const transaction = await getTransactionByExternalReference(req.params.externalReference);
       if (!transaction) {
@@ -403,47 +415,26 @@ export function createApp() {
 
       return res.json(transaction);
     } catch (error) {
-      return res.status(500).json({ message: 'Error fetching transaction', detail: error.message });
+      console.error('[Payment Service] Error fetching transaction:', error);
+      return res.status(500).json({ message: 'Error fetching transaction' });
     }
   });
 
+  // The driver's app polls this after checkout (see mobile's payment/pending.tsx) with the
+  // bookingId as externalReference -- only for their own booking. It deliberately takes no
+  // client-supplied Mercado Pago payment id: the payment is always looked up by reference.
   app.post('/api/payments/verify-status', requireGatewaySecret, async (req, res) => {
     try {
-      const { externalReference, paymentId } = req.body;
-
-      if (!externalReference && !paymentId) {
-        return res.status(400).json({
-          message: 'Either externalReference or paymentId is required'
-        });
+      const externalReference = req.body?.externalReference;
+      const booking = await loadOwnBooking(req, res, externalReference);
+      if (!booking) {
+        return;
       }
 
-      let transaction = null;
       let payment = null;
-
-      // Buscar transacción existente
-      if (paymentId) {
-        transaction = await getTransactionByPaymentId(paymentId);
-        if (transaction) {
-          payment = await getPaymentById(transaction.payment_id);
-        }
-      } else if (externalReference) {
-        transaction = await getTransactionByExternalReference(externalReference);
-        if (transaction) {
-          payment = await getPaymentById(transaction.payment_id);
-        }
-      }
-
-      // Si no hay transacción, intentar buscar el pago directamente en Mercado Pago
-      if (!payment && paymentId) {
-        try {
-          payment = await getPaymentById(paymentId);
-          // Guardar la transacción si se encontró el pago
-          if (payment) {
-            transaction = await saveTransaction(payment);
-          }
-        } catch (error) {
-          console.log(`[Payment Verify] Payment ${paymentId} not found in Mercado Pago:`, error.message);
-        }
+      let transaction = await getTransactionByExternalReference(externalReference);
+      if (transaction) {
+        payment = await getPaymentById(transaction.payment_id);
       }
 
       // Mobile's polling loop (pending.tsx) only ever has the bookingId
@@ -465,11 +456,7 @@ export function createApp() {
       }
 
       if (!transaction && !payment) {
-        return res.status(404).json({
-          message: 'Payment not found',
-          externalReference,
-          paymentId
-        });
+        return res.status(404).json({ message: 'Payment not found', externalReference });
       }
 
       // Si el pago existe pero no está en nuestra DB, guardarlo
@@ -500,27 +487,43 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Verify] Error:', error);
-      return res.status(500).json({
-        message: 'Error verifying payment status',
-        detail: error.message
-      });
+      return res.status(500).json({ message: 'Error verifying payment status' });
     }
   });
 
-  // Same reasoning as demo-pay above: no gateway route, but publicly
-  // reachable on payment-service's own Render URL, so it needs its own auth.
-  app.post('/internal/refund', requireAdmin, async (req, res) => {
+  // Where the driver's money stands for a booking that was cancelled after being paid
+  // (driver cancelled, owner rejected or never answered) -- shown on the booking's own
+  // screen. Read-only: unlike verify-status it never tries to confirm anything.
+  app.get('/api/payments/refund-status/:bookingId', requireGatewaySecret, async (req, res) => {
     try {
-      const { order_id } = req.body;
-
-      await markTransactionAsRefunded(order_id);
-
-      res.json({ success: true });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({
-        detail: 'Failed to refund payment'
+      const booking = await loadOwnBooking(req, res, req.params.bookingId);
+      if (!booking) {
+        return;
+      }
+      const transaction = await getTransactionByExternalReference(booking.id);
+      if (!transaction) {
+        return res.json({ status: 'none' });
+      }
+      // A refund that failed every automatic retry (see refundRetryJob.js) is no longer
+      // "in progress" -- it's waiting on someone from ParkLink, and the driver should know.
+      const retriesExhausted =
+        transaction.status === 'refund_failed' && Number(transaction.refund_attempts) >= config.refundRetryMaxAttempts;
+      const status =
+        transaction.status === 'refunded'
+          ? 'refunded'
+          : retriesExhausted
+            ? 'delayed'
+            : ['approved', 'refunding', 'refund_failed'].includes(transaction.status)
+              ? 'in_progress'
+              : 'none';
+      return res.json({
+        status,
+        amount: Number(transaction.amount),
+        refundedAt: status === 'refunded' ? transaction.updated_at : null,
       });
+    } catch (error) {
+      console.error('[Payment Service] Error fetching refund status:', error);
+      return res.status(500).json({ message: 'Error fetching refund status' });
     }
   });
 

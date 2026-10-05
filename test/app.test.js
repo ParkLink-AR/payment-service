@@ -11,14 +11,18 @@ jest.unstable_mockModule('../src/db.js', () => ({
   saveTransaction: jest.fn(),
   getTotalTransactionAmount: jest.fn(),
   getTransactionAmountByPeriod: jest.fn(),
-  markTransactionAsRefunded: jest.fn(),
+  claimTransactionForRefund: jest.fn(),
   markTransactionAsRefundedByPaymentId: jest.fn(),
   markTransactionAsRefundFailed: jest.fn()
 }));
 
+jest.unstable_mockModule('../src/bookingClient.js', () => ({
+  getBooking: jest.fn(),
+  confirmBooking: jest.fn()
+}));
+
 jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   createCheckoutPreference: jest.fn(),
-  generateExternalReference: jest.fn(),
   getPaymentById: jest.fn(),
   refundPayment: jest.fn(),
   searchPaymentByExternalReference: jest.fn()
@@ -31,14 +35,15 @@ const {
   saveTransaction,
   getTotalTransactionAmount,
   getTransactionAmountByPeriod,
-  markTransactionAsRefunded,
+  claimTransactionForRefund,
   markTransactionAsRefundedByPaymentId,
   markTransactionAsRefundFailed
 } = await import('../src/db.js');
 
+const { getBooking, confirmBooking } = await import('../src/bookingClient.js');
+
 const {
   createCheckoutPreference,
-  generateExternalReference,
   getPaymentById,
   refundPayment,
   searchPaymentByExternalReference
@@ -94,51 +99,79 @@ describe('Payment Service App', () => {
       pool.query.mockRejectedValueOnce(new Error('DB connection failed'));
       const res = await request(app).get('/health');
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ status: 'error', message: 'DB connection failed' });
+      expect(res.body).toEqual({ status: 'error' });
     });
   });
 
+  const DRIVER_ID = 'driver-1';
+  const ownBooking = (overrides = {}) => ({
+    id: 'booking-1',
+    user_id: DRIVER_ID,
+    status: 'PENDING_PAYMENT',
+    amount: 150000,
+    hold_expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+    ...overrides,
+  });
+
   describe('POST /api/payments/create-preference', () => {
-    it('should return 400 if amount is not a positive number', async () => {
-      const res = await request(app).post('/api/payments/create-preference').send({ amount: -10 });
+    it('requires an externalReference (the bookingId)', async () => {
+      const res = await request(app).post('/api/payments/create-preference').set('x-user-id', DRIVER_ID).send({});
       expect(res.status).toBe(400);
-      expect(res.body.message).toBe('amount must be a positive number');
     });
 
-    it('should create preference successfully', async () => {
-      createCheckoutPreference.mockResolvedValueOnce({
-        id: 'pref_123',
-        init_point: 'https://mp.com/checkout/123'
-      });
+    it('rejects a booking that belongs to someone else', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ user_id: 'someone-else' }));
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1' });
+      expect(res.status).toBe(403);
+      expect(createCheckoutPreference).not.toHaveBeenCalled();
+    });
 
-      const res = await request(app).post('/api/payments/create-preference').send({
-        amount: 100,
-        orderId: 1
-      });
+    it('rejects a booking whose hold already expired', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ hold_expires_at: new Date(Date.now() - 1000).toISOString() }));
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1' });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('HOLD_EXPIRED');
+    });
+
+    it('charges the booking\'s server-side price, ignoring any amount the client sends', async () => {
+      const booking = ownBooking();
+      getBooking.mockResolvedValueOnce(booking);
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_123', init_point: 'https://mp.com/checkout/123' });
+
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1', amount: 1, items: [{ title: 'x', unit_price: 1 }] });
 
       expect(res.status).toBe(201);
-      expect(res.body).toMatchObject({
-        preferenceId: 'pref_123',
-        checkoutUrl: 'https://mp.com/checkout/123',
-        orderId: 1
-      });
-      expect(res.body.externalReference).toBeDefined();
+      expect(res.body).toEqual({ preferenceId: 'pref_123', checkoutUrl: 'https://mp.com/checkout/123', externalReference: 'booking-1' });
+      expect(createCheckoutPreference).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 1500, externalReference: 'booking-1', expiresAt: booking.hold_expires_at }),
+      );
     });
 
     it('should handle internal errors', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
       createCheckoutPreference.mockRejectedValueOnce(new Error('MP Error'));
-      const res = await request(app).post('/api/payments/create-preference').send({ amount: 100 });
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1' });
       expect(res.status).toBe(500);
-      expect(res.body.message).toBe('Error creating Mercado Pago preference');
+      expect(res.body).toEqual({ message: 'Error creating Mercado Pago preference' });
     });
 
     it('points back_urls at this service\'s own /payment-return bridge, not directly at the app deep link', async () => {
-      createCheckoutPreference.mockResolvedValueOnce({
-        id: 'pref_123',
-        init_point: 'https://mp.com/checkout/123'
-      });
+      getBooking.mockResolvedValueOnce(ownBooking());
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_123', init_point: 'https://mp.com/checkout/123' });
 
-      await request(app).post('/api/payments/create-preference').send({ amount: 100 });
+      await request(app).post('/api/payments/create-preference').set('x-user-id', DRIVER_ID).send({ externalReference: 'booking-1' });
 
       expect(createCheckoutPreference).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -152,26 +185,7 @@ describe('Payment Service App', () => {
     });
   });
 
-  describe('POST /api/payments/external-reference', () => {
-    it('should generate external reference', async () => {
-      generateExternalReference.mockResolvedValueOnce({ externalReference: 'ext_ref_123' });
-      const res = await request(app).post('/api/payments/external-reference');
-      expect(res.status).toBe(201);
-      expect(res.body).toEqual({ externalReference: 'ext_ref_123' });
-    });
-
-    it('should handle internal errors', async () => {
-      generateExternalReference.mockRejectedValueOnce(new Error('Error generating'));
-      const res = await request(app).post('/api/payments/external-reference');
-      expect(res.status).toBe(500);
-    });
-  });
-
   describe('POST /api/payments/webhook', () => {
-    beforeEach(() => {
-      global.fetch = jest.fn();
-    });
-
     const getValidHeaders = (paymentId) => {
       const ts = Date.now().toString();
       const requestId = 'req_123';
@@ -179,15 +193,16 @@ describe('Payment Service App', () => {
       const signature = crypto.createHmac('sha256', secret)
         .update(`id:${paymentId};request-id:${requestId};ts:${ts};`)
         .digest('hex');
-      
+
       return {
         'x-request-id': requestId,
         'x-signature': `ts=${ts},v1=${signature}`
       };
     };
 
+    const approvedPayment = { id: '123', status: 'approved', external_reference: 'booking-uuid-123', transaction_amount: 1500 };
+
     it('should ignore if missing paymentId', async () => {
-      // paymentId undefined, but we need to pass verification which needs a paymentId in headers/query to verify
       const headers = getValidHeaders('none');
       const res = await request(app).post('/api/payments/webhook')
         .set(headers)
@@ -196,125 +211,228 @@ describe('Payment Service App', () => {
       expect(res.body.message).toBe('Webhook ignored');
     });
 
-    it('should process payment and confirm booking if approved', async () => {
-      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'approved', external_reference: 'booking-uuid-123' });
+    it('confirms the booking with the amount actually charged, in centavos', async () => {
+      getPaymentById.mockResolvedValueOnce(approvedPayment);
       saveTransaction.mockResolvedValueOnce({ id: 'txn_123', external_reference: 'booking-uuid-123' });
-      global.fetch.mockResolvedValueOnce({ ok: true });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
 
-      const headers = getValidHeaders('123');
       const res = await request(app).post('/api/payments/webhook')
-        .set(headers)
+        .set(getValidHeaders('123'))
         .send({ type: 'payment', data: { id: '123' } });
-      
+
       expect(res.status).toBe(200);
       expect(res.body.paymentStatus).toBe('approved');
       expect(res.body.bookingId).toBe('booking-uuid-123');
-      expect(saveTransaction).toHaveBeenCalled();
-      expect(global.fetch).toHaveBeenCalled();
+      expect(confirmBooking).toHaveBeenCalledWith('booking-uuid-123', '123', 150000);
+      expect(refundPayment).not.toHaveBeenCalled();
     });
 
-    it('should handle webhook error', async () => {
-      getPaymentById.mockRejectedValueOnce(new Error('MP fetch failed'));
-      const headers = getValidHeaders('123');
+    it('refunds a payment booking-service refuses because the hold expired', async () => {
+      getPaymentById.mockResolvedValueOnce(approvedPayment);
+      saveTransaction.mockResolvedValueOnce({ id: 'txn_123' });
+      confirmBooking.mockResolvedValueOnce({ ok: false, status: 400, code: 'HOLD_EXPIRED' });
+      claimTransactionForRefund.mockResolvedValueOnce(true);
+      refundPayment.mockResolvedValueOnce({ status: 'approved' });
+
       const res = await request(app).post('/api/payments/webhook')
-        .set(headers)
+        .set(getValidHeaders('123'))
+        .send({ type: 'payment', data: { id: '123' } });
+
+      expect(res.status).toBe(200);
+      expect(refundPayment).toHaveBeenCalledWith('123');
+      expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('123');
+    });
+
+    it('does not refund twice when another path already claimed the refund', async () => {
+      getPaymentById.mockResolvedValueOnce(approvedPayment);
+      saveTransaction.mockResolvedValueOnce({ id: 'txn_123' });
+      confirmBooking.mockResolvedValueOnce({ ok: false, status: 400, code: 'AMOUNT_MISMATCH' });
+      claimTransactionForRefund.mockResolvedValueOnce(false);
+
+      await request(app).post('/api/payments/webhook')
+        .set(getValidHeaders('123'))
+        .send({ type: 'payment', data: { id: '123' } });
+
+      expect(refundPayment).not.toHaveBeenCalled();
+    });
+
+    it('flags the automatic refund for retry when Mercado Pago fails it', async () => {
+      getPaymentById.mockResolvedValueOnce(approvedPayment);
+      saveTransaction.mockResolvedValueOnce({ id: 'txn_123' });
+      confirmBooking.mockResolvedValueOnce({ ok: false, status: 400, code: 'HOLD_EXPIRED' });
+      claimTransactionForRefund.mockResolvedValueOnce(true);
+      refundPayment.mockRejectedValueOnce(new Error('MP down'));
+
+      await request(app).post('/api/payments/webhook')
+        .set(getValidHeaders('123'))
+        .send({ type: 'payment', data: { id: '123' } });
+
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('123');
+      expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+
+    it('does not refund on a transient booking-service failure', async () => {
+      getPaymentById.mockResolvedValueOnce(approvedPayment);
+      saveTransaction.mockResolvedValueOnce({ id: 'txn_123' });
+      confirmBooking.mockResolvedValueOnce({ ok: false, status: 502, code: 'PARKING_SERVICE_ERROR' });
+
+      await request(app).post('/api/payments/webhook')
+        .set(getValidHeaders('123'))
+        .send({ type: 'payment', data: { id: '123' } });
+
+      expect(claimTransactionForRefund).not.toHaveBeenCalled();
+    });
+
+    it('should handle webhook error without leaking internals', async () => {
+      getPaymentById.mockRejectedValueOnce(new Error('MP fetch failed'));
+      const res = await request(app).post('/api/payments/webhook')
+        .set(getValidHeaders('123'))
         .send({ type: 'payment', data: { id: '123' } });
       expect(res.status).toBe(500);
+      expect(res.body.detail).toBeUndefined();
     });
   });
 
   describe('GET /api/payments/:paymentId', () => {
+    let adminToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+    });
+
+    it('is staff-only', async () => {
+      const res = await request(app).get('/api/payments/123');
+      expect(res.status).toBe(401);
+      expect(getTransactionByPaymentId).not.toHaveBeenCalled();
+    });
+
     it('should return 404 if not found', async () => {
       getTransactionByPaymentId.mockResolvedValueOnce(null);
-      const res = await request(app).get('/api/payments/123');
+      const res = await request(app).get('/api/payments/123').set('Authorization', `Bearer ${adminToken}`);
       expect(res.status).toBe(404);
     });
 
     it('should return transaction if found', async () => {
       getTransactionByPaymentId.mockResolvedValueOnce({ id: 'txn_1' });
-      const res = await request(app).get('/api/payments/123');
+      const res = await request(app).get('/api/payments/123').set('Authorization', `Bearer ${adminToken}`);
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ id: 'txn_1' });
     });
   });
 
   describe('GET /api/payments/external-reference/:externalReference', () => {
-    it('should return 404 if not found', async () => {
-      getTransactionByExternalReference.mockResolvedValueOnce(null);
+    let adminToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+    });
+
+    it('is staff-only', async () => {
       const res = await request(app).get('/api/payments/external-reference/ext_1');
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(401);
     });
 
     it('should return transaction if found', async () => {
       getTransactionByExternalReference.mockResolvedValueOnce({ id: 'txn_1' });
-      const res = await request(app).get('/api/payments/external-reference/ext_1');
+      const res = await request(app)
+        .get('/api/payments/external-reference/ext_1')
+        .set('Authorization', `Bearer ${adminToken}`);
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ id: 'txn_1' });
     });
   });
 
   describe('POST /api/payments/verify-status', () => {
-    it('should return 400 if neither externalReference nor paymentId is provided', async () => {
-      const res = await request(app).post('/api/payments/verify-status').send({});
+    const verify = (body) => request(app).post('/api/payments/verify-status').set('x-user-id', DRIVER_ID).send(body);
+
+    it('requires an externalReference', async () => {
+      const res = await verify({});
       expect(res.status).toBe(400);
     });
 
-    it('should verify status using paymentId when transaction exists', async () => {
-      getTransactionByPaymentId.mockResolvedValueOnce({ payment_id: '123', status: 'approved' });
-      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'approved' });
-
-      const res = await request(app).post('/api/payments/verify-status').send({ paymentId: '123' });
-      expect(res.status).toBe(200);
-      expect(res.body.currentStatus).toBe('approved');
-      expect(res.body.needsReconciliation).toBe(true);
+    it('ignores a client-supplied Mercado Pago payment id', async () => {
+      const res = await verify({ paymentId: 'mock-approved-1-1500-booking-1' });
+      expect(res.status).toBe(400);
+      expect(getPaymentById).not.toHaveBeenCalled();
     });
 
-    it('should verify status and save transaction if not in DB', async () => {
-      getTransactionByPaymentId.mockResolvedValueOnce(null);
-      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'pending' });
-      saveTransaction.mockResolvedValueOnce({ status: 'pending' });
+    it('rejects polling someone else\'s booking', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ user_id: 'someone-else' }));
+      const res = await verify({ externalReference: 'booking-1' });
+      expect(res.status).toBe(403);
+      expect(getTransactionByExternalReference).not.toHaveBeenCalled();
+    });
 
-      const res = await request(app).post('/api/payments/verify-status').send({ paymentId: '123' });
+    it('returns the stored payment\'s current status', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({ payment_id: '123', status: 'pending' });
+      getPaymentById.mockResolvedValueOnce({ id: '123', status: 'pending' });
+
+      const res = await verify({ externalReference: 'booking-1' });
       expect(res.status).toBe(200);
       expect(res.body.currentStatus).toBe('pending');
-      expect(saveTransaction).toHaveBeenCalled();
-    });
-
-    it('should return 404 if payment not found anywhere', async () => {
-      getTransactionByPaymentId.mockResolvedValueOnce(null);
-      getPaymentById.mockResolvedValueOnce(null); // or throw error
-      const res = await request(app).post('/api/payments/verify-status').send({ paymentId: '123' });
-      expect(res.status).toBe(404);
+      expect(confirmBooking).not.toHaveBeenCalled();
     });
 
     it('falls back to searching MP by externalReference when nothing is in the DB (no webhook)', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
       getTransactionByExternalReference.mockResolvedValueOnce(null);
       searchPaymentByExternalReference.mockResolvedValueOnce({
-        id: 'mp-1', status: 'approved', external_reference: 'booking-1',
+        id: 'mp-1', status: 'approved', external_reference: 'booking-1', transaction_amount: 1500,
       });
       saveTransaction.mockResolvedValueOnce({ status: 'approved', external_reference: 'booking-1' });
-      global.fetch = jest.fn().mockResolvedValueOnce({ ok: true });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
 
-      const res = await request(app).post('/api/payments/verify-status').send({ externalReference: 'booking-1' });
+      const res = await verify({ externalReference: 'booking-1' });
 
       expect(res.status).toBe(200);
       expect(res.body.currentStatus).toBe('approved');
       expect(searchPaymentByExternalReference).toHaveBeenCalledWith('booking-1');
-      expect(global.fetch).toHaveBeenCalledWith(
-        expect.stringContaining('/bookings/booking-1/confirm'),
-        expect.objectContaining({
-          method: 'POST',
-          headers: expect.objectContaining({ 'X-Internal-Key': process.env.INTERNAL_SERVICE_KEY }),
-        }),
-      );
+      expect(confirmBooking).toHaveBeenCalledWith('booking-1', 'mp-1', 150000);
     });
 
     it('returns 404 when the MP search fallback also finds nothing', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
       getTransactionByExternalReference.mockResolvedValueOnce(null);
       searchPaymentByExternalReference.mockResolvedValueOnce(null);
 
-      const res = await request(app).post('/api/payments/verify-status').send({ externalReference: 'booking-2' });
+      const res = await verify({ externalReference: 'booking-1' });
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe('GET /api/payments/refund-status/:bookingId', () => {
+    const refundStatus = (userId) =>
+      request(app).get('/api/payments/refund-status/booking-1').set('x-user-id', userId);
+
+    it('reports a completed refund with its amount and date', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ status: 'CANCELLED' }));
+      getTransactionByExternalReference.mockResolvedValueOnce({
+        status: 'refunded', amount: '1500.00', updated_at: '2026-10-05T12:00:00Z',
+      });
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: 'refunded', amount: 1500, refundedAt: '2026-10-05T12:00:00Z' });
+    });
+
+    it('reports a refund that failed and is being retried as still in progress', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ status: 'CANCELLED' }));
+      getTransactionByExternalReference.mockResolvedValueOnce({ status: 'refund_failed', refund_attempts: 1, amount: '1500.00' });
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.body.status).toBe('in_progress');
+    });
+
+    it('reports a refund that exhausted its automatic retries as delayed', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ status: 'CANCELLED' }));
+      getTransactionByExternalReference.mockResolvedValueOnce({ status: 'refund_failed', refund_attempts: 5, amount: '1500.00' });
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.body.status).toBe('delayed');
+    });
+
+    it('is only for the booking\'s own driver', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ user_id: 'someone-else' }));
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.status).toBe(403);
     });
   });
 
@@ -359,60 +477,19 @@ describe('Payment Service App', () => {
       expect(saveTransaction).not.toHaveBeenCalled();
     });
 
-    it('marks the booking as paid for an admin', async () => {
-      global.fetch = jest.fn().mockResolvedValueOnce({ ok: true });
+    it('marks the booking as paid for an admin, at the booking\'s own price', async () => {
+      getBooking.mockResolvedValueOnce({ id: 'b1', user_id: 'd1', status: 'PENDING_PAYMENT', amount: 150000 });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
       saveTransaction.mockResolvedValueOnce({ id: 'tx1' });
 
       const res = await request(app)
         .post('/api/payments/demo-pay')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ bookingId: 'b1', amount: 1000 });
+        .send({ bookingId: 'b1' });
 
       expect(res.status).toBe(201);
       expect(res.body.status).toBe('approved');
-      expect(saveTransaction).toHaveBeenCalled();
-    });
-  });
-
-  describe('POST /internal/refund', () => {
-    let adminToken;
-    beforeAll(async () => {
-      const jwt = (await import('jsonwebtoken')).default;
-      adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
-    });
-
-    it('requires an admin token', async () => {
-      const res = await request(app).post('/internal/refund').send({ order_id: 1 });
-      expect(res.status).toBe(401);
-      expect(markTransactionAsRefunded).not.toHaveBeenCalled();
-    });
-
-    it('rejects non-admin token', async () => {
-      const jwt = (await import('jsonwebtoken')).default;
-      const userToken = jwt.sign({ role: 'user' }, process.env.JWT_SECRET);
-      const res = await request(app)
-        .post('/internal/refund')
-        .set('Authorization', `Bearer ${userToken}`)
-        .send({ order_id: 1 });
-      expect(res.status).toBe(403);
-    });
-
-    it('rejects invalid signature token', async () => {
-      const res = await request(app)
-        .post('/internal/refund')
-        .set('Authorization', 'Bearer invalid.token.value')
-        .send({ order_id: 1 });
-      expect(res.status).toBe(401);
-    });
-
-    it('refunds for an admin', async () => {
-      markTransactionAsRefunded.mockResolvedValueOnce();
-      const res = await request(app)
-        .post('/internal/refund')
-        .set('Authorization', `Bearer ${adminToken}`)
-        .send({ order_id: 1 });
-      expect(res.status).toBe(200);
-      expect(res.body).toEqual({ success: true });
+      expect(confirmBooking).toHaveBeenCalledWith('b1', expect.stringMatching(/^demo-/), 150000);
     });
   });
 

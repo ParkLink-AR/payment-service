@@ -17,6 +17,11 @@ const preferenceClient = new Preference(client);
 const paymentClient = new Payment(client);
 const refundClient = new PaymentRefund(client);
 
+// Payment types excluded from checkout: cash vouchers (Rapipago/Pago Fácil) and ATM
+// transfers only get approved hours or days later -- long after the booking's hold has
+// expired and the slot may belong to someone else.
+const EXCLUDED_PAYMENT_TYPES = [{ id: 'ticket' }, { id: 'atm' }];
+
 export async function createCheckoutPreference({
   amount,
   title,
@@ -24,30 +29,10 @@ export async function createCheckoutPreference({
   currency,
   payerEmail,
   externalReference,
-  orderId,
-  orderIds,
-  items,
   backUrls,
   notificationUrl,
+  expiresAt,
 }) {
-  const preferenceItems = Array.isArray(items) && items.length > 0
-    ? items.map((item) => ({
-        title: item.title,
-        description: item.description || item.title,
-        quantity: Number(item.quantity || 1),
-        unit_price: Number(item.unit_price),
-        currency_id: item.currency_id || currency,
-      }))
-    : [
-        {
-          title,
-          description,
-          quantity: 1,
-          unit_price: amount,
-          currency_id: currency,
-        },
-      ];
-
   const normalizedBackUrls = backUrls
     ? {
         success: backUrls.success?.trim(),
@@ -65,30 +50,21 @@ export async function createCheckoutPreference({
     Boolean(normalizedBackUrls?.success) && normalizedBackUrls.success.startsWith('https://');
 
   const preferenceBody = {
-    items: preferenceItems,
+    items: [{ title, description, quantity: 1, unit_price: amount, currency_id: currency }],
     payer: payerEmail ? { email: payerEmail } : undefined,
     external_reference: externalReference,
-    metadata: orderIds?.length
-      ? { order_ids: orderIds.map((value) => String(value)), order_id: orderId ? String(orderId) : undefined }
-      : orderId
-        ? { order_id: String(orderId) }
-        : undefined,
     back_urls: normalizedBackUrls,
     auto_return: shouldUseAutoReturn ? 'approved' : undefined,
     notification_url: normalizedNotificationUrl,
+    // Approved or rejected right away -- never left "pending"/"in_process" to be
+    // approved after the booking's hold is gone.
+    binary_mode: true,
+    payment_methods: { excluded_payment_types: EXCLUDED_PAYMENT_TYPES },
+    // The checkout link stops working when the booking's hold does.
+    ...(expiresAt ? { expires: true, expiration_date_to: new Date(expiresAt).toISOString() } : {}),
   };
 
-  console.log('[MercadoPago] Creating preference with body:', JSON.stringify(preferenceBody, null, 2));
-
-  const response = await preferenceClient.create({
-    body: preferenceBody,
-  });
-
-  return response;
-}
-
-export async function generateExternalReference() {
-  return { externalReference: crypto.randomUUID() };
+  return preferenceClient.create({ body: preferenceBody });
 }
 
 /**
@@ -107,41 +83,16 @@ export async function searchPaymentByExternalReference(externalReference) {
 }
 
 export async function getPaymentById(paymentId) {
-  const idStr = String(paymentId);
-  if (idStr.startsWith('mock-')) {
-    // Formato: mock-status-orderId-amount-externalRef
-    // Ejemplo: mock-approved-123-1500-ref123
-    const parts = idStr.split('-');
-    const status = parts[1] || 'approved';
-    const orderId = parts[2] || '999';
-    const amount = Number(parts[3] || '1000');
-    const externalRef = parts.slice(4).join('-') || 'mock-ref';
-
-    return {
-      id: idStr,
-      status: status,
-      external_reference: externalRef,
-      transaction_amount: amount,
-      currency_id: 'ARS',
-      order: { id: 'pref-' + orderId },
-      payer: { email: 'mock_buyer@test.com' },
-      date_approved: new Date().toISOString(),
-      metadata: {
-        order_id: String(orderId),
-      },
-    };
-  }
-  return paymentClient.get({ id: idStr });
+  return paymentClient.get({ id: String(paymentId) });
 }
 
-// Full refund via Mercado Pago's real API. Payment ids created by demo-pay
-// (see getPaymentById above, "mock-" prefix) or by hand-seeded test data
-// ("seed-demo-" prefix) don't exist on Mercado Pago's side, so calling
-// refund on them would always fail -- treated as a no-op success instead,
-// so only a genuinely real payment's refund failure reaches app.js's catch.
+// Full refund via Mercado Pago's real API. Payment ids created by demo-pay ("demo-"
+// prefix) or by hand-seeded test data ("seed-demo-"/"mock-" prefixes) don't exist on
+// Mercado Pago's side, so calling refund on them would always fail -- treated as a no-op
+// success instead, so only a genuinely real payment's refund failure reaches the caller.
 export async function refundPayment(paymentId) {
   const idStr = String(paymentId);
-  if (idStr.startsWith('mock-') || idStr.startsWith('seed-demo-')) {
+  if (idStr.startsWith('demo-') || idStr.startsWith('mock-') || idStr.startsWith('seed-demo-')) {
     return { id: idStr, status: 'refunded', mocked: true };
   }
   return refundClient.create({ payment_id: idStr });

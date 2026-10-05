@@ -76,7 +76,14 @@ export async function saveTransaction(payment) {
       order_id = EXCLUDED.order_id,
       amount = EXCLUDED.amount,
       currency = EXCLUDED.currency,
-      status = EXCLUDED.status,
+      -- A refund we started locally outranks Mercado Pago still reporting the payment as
+      -- approved (it does until the refund is processed) -- otherwise re-saving it would
+      -- make it look refundable again.
+      status = CASE
+        WHEN transactions.status IN ('refunding', 'refunded', 'refund_failed') AND EXCLUDED.status = 'approved'
+          THEN transactions.status
+        ELSE EXCLUDED.status
+      END,
       payer_email = EXCLUDED.payer_email,
       raw_payload = EXCLUDED.raw_payload,
       approved_at = EXCLUDED.approved_at,
@@ -135,18 +142,23 @@ export async function getTransactionAmountByPeriod(startDate, endDate) {
   return result.rows[0].total_amount;
 }
 
-export async function markTransactionAsRefunded(orderId) {
-  await pool.query(
+// Atomically claims an approved transaction for an automatic refund (status 'refunding'),
+// so the webhook and the app's polling -- which can both see the same approval at the
+// same time -- never both refund it. Resolves to true only for the caller that won.
+export async function claimTransactionForRefund(paymentId) {
+  const result = await pool.query(
     `
     UPDATE transactions
     SET
-      status = 'refunded',
+      status = 'refunding',
       updated_at = NOW()
-    WHERE order_id = $1
+    WHERE payment_id = $1
       AND status = 'approved'
+    RETURNING payment_id
     `,
-    [orderId]
+    [String(paymentId)]
   );
+  return result.rowCount > 0;
 }
 
 export async function markTransactionAsRefundedByPaymentId(paymentId) {
@@ -157,7 +169,7 @@ export async function markTransactionAsRefundedByPaymentId(paymentId) {
       status = 'refunded',
       updated_at = NOW()
     WHERE payment_id = $1
-      AND status = 'approved'
+      AND status IN ('approved', 'refunding', 'refund_failed')
     `,
     [String(paymentId)]
   );
