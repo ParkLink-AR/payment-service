@@ -98,3 +98,30 @@ export async function refundPayment(paymentId) {
   return refundClient.create({ payment_id: idStr });
 }
 
+// What a failed refund means, from the error Mercado Pago's SDK rejected with -- saved on
+// the transaction so the admin panel can say why, and so the retry job doesn't keep
+// retrying failures that can never succeed:
+// - 'test_payment': "Unauthorized use of live credentials" (cause code 7) -- a payment made
+//   by one of Mercado Pago's test users, which their API never lets anyone refund.
+// - 'payment_not_found': Mercado Pago doesn't know the payment.
+// - 'unauthorized': the access token can't refund it (other 401/403).
+// - 'transient': anything else (timeouts, 5xx, network) -- worth retrying.
+export function describeRefundError(error) {
+  const status = Number(error?.status ?? error?.statusCode ?? 0);
+  const causes = Array.isArray(error?.cause) ? error.cause : [];
+  const text = [error?.message, error?.error, ...causes.map((c) => c?.description)]
+    .filter((part) => typeof part === 'string' && part)
+    .join(' -- ');
+  const detail = (text || String(error ?? 'unknown error')).slice(0, 500);
+
+  if (causes.some((c) => String(c?.code) === '7') || /live credentials/i.test(text)) {
+    return { code: 'test_payment', permanent: true, detail };
+  }
+  if (status === 404 || /resource not found|not found/i.test(text)) {
+    return { code: 'payment_not_found', permanent: true, detail };
+  }
+  if (status === 401 || status === 403) {
+    return { code: 'unauthorized', permanent: true, detail };
+  }
+  return { code: 'transient', permanent: false, detail };
+}

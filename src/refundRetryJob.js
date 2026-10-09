@@ -5,7 +5,7 @@
 // simply trying again a bit later would very often just work.
 import { config } from './config.js';
 import { listRefundFailedTransactions, markTransactionAsRefundedByPaymentId, markTransactionAsRefundFailed } from './db.js';
-import { refundPayment } from './mercadoPago.js';
+import { describeRefundError, refundPayment } from './mercadoPago.js';
 
 export async function retryFailedRefunds() {
   const pending = await listRefundFailedTransactions(config.refundRetryMaxAttempts);
@@ -17,9 +17,10 @@ export async function retryFailedRefunds() {
     } catch (error) {
       // Still failing -- markTransactionAsRefundFailed bumps refund_attempts, so once it
       // hits config.refundRetryMaxAttempts this same transaction stops being picked up by
-      // listRefundFailedTransactions above, and genuinely needs a human.
+      // listRefundFailedTransactions above, and genuinely needs a human (the admin panel's
+      // "Reembolsos pendientes"). A failure retrying can never fix jumps there right away.
       console.error(`[RefundRetry] Refund retry failed for payment ${paymentId}:`, error);
-      await markTransactionAsRefundFailed(paymentId);
+      await markTransactionAsRefundFailed(paymentId, describeRefundError(error), config.refundRetryMaxAttempts);
     }
   }
   return pending.length;

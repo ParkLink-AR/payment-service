@@ -30,6 +30,18 @@ export async function initDatabase() {
     -- unrefundable payment (e.g. wrong payment method) doesn't get hammered forever.
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_attempts INT NOT NULL DEFAULT 0;
 
+    -- Why the last refund attempt failed (see describeRefundError in mercadoPago.js): a
+    -- short code for the admin panel, plus Mercado Pago's own message.
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_error_code VARCHAR(32);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_last_error TEXT;
+
+    -- A failed refund an admin closed by hand (see resolveFailedRefund): status becomes
+    -- 'refunded_manually' (the money went back some other way) or 'refund_discarded'
+    -- (nothing to give back, e.g. test data) -- who did it, when and why.
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_resolution_note TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_resolved_by VARCHAR(64);
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_resolved_at TIMESTAMPTZ;
+
     CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
     CREATE INDEX IF NOT EXISTS idx_transactions_external_reference ON transactions(external_reference);
     CREATE INDEX IF NOT EXISTS idx_transactions_order_id ON transactions(order_id);
@@ -80,7 +92,8 @@ export async function saveTransaction(payment) {
       -- approved (it does until the refund is processed) -- otherwise re-saving it would
       -- make it look refundable again.
       status = CASE
-        WHEN transactions.status IN ('refunding', 'refunded', 'refund_failed') AND EXCLUDED.status = 'approved'
+        WHEN transactions.status IN ('refunding', 'refunded', 'refund_failed', 'refunded_manually', 'refund_discarded')
+          AND EXCLUDED.status = 'approved'
           THEN transactions.status
         ELSE EXCLUDED.status
       END,
@@ -177,21 +190,28 @@ export async function markTransactionAsRefundedByPaymentId(paymentId) {
 
 // A real Mercado Pago refund call failed (see /internal/refund-by-payment, and
 // refundRetryJob.js's own retries) -- distinct from 'refunded' so the transaction shows
-// up as needing manual follow-up instead of silently looking like the money went back.
+// up as needing follow-up instead of silently looking like the money went back.
 // Bumps refund_attempts every time this is called, first failure included, so the retry
 // job's cutoff (config.refundRetryMaxAttempts) counts every attempt, not just its own.
-export async function markTransactionAsRefundFailed(paymentId) {
-  await pool.query(
+// `failure` is describeRefundError()'s result: saved for the admin panel, and a
+// permanent one jumps straight to the cutoff -- retrying it could never work.
+// Resolves to true when the transaction exists here (so the refund is tracked), false
+// when there's nothing to flag.
+export async function markTransactionAsRefundFailed(paymentId, failure = null, maxAttempts = 0) {
+  const result = await pool.query(
     `
     UPDATE transactions
     SET
       status = 'refund_failed',
-      refund_attempts = refund_attempts + 1,
+      refund_attempts = CASE WHEN $3 THEN GREATEST(refund_attempts + 1, $4) ELSE refund_attempts + 1 END,
+      refund_error_code = $2,
+      refund_last_error = $5,
       updated_at = NOW()
     WHERE payment_id = $1
     `,
-    [String(paymentId)]
+    [String(paymentId), failure?.code ?? null, Boolean(failure?.permanent), maxAttempts, failure?.detail ?? null]
   );
+  return result.rowCount > 0;
 }
 
 // Transactions still owing a refund, oldest-failed-first, that haven't already exhausted
@@ -208,4 +228,60 @@ export async function listRefundFailedTransactions(maxAttempts) {
     [maxAttempts]
   );
   return result.rows;
+}
+
+// Every refund still owed, newest failure first -- the admin panel's "Reembolsos
+// pendientes", including the ones the retry job already gave up on.
+export async function listFailedRefunds() {
+  const result = await pool.query(
+    `
+    SELECT payment_id, external_reference, amount, currency, payer_email, approved_at,
+           refund_attempts, refund_error_code, refund_last_error, created_at, updated_at
+    FROM transactions
+    WHERE status = 'refund_failed'
+    ORDER BY updated_at DESC
+    `
+  );
+  return result.rows;
+}
+
+export async function countFailedRefunds() {
+  const result = await pool.query(`SELECT COUNT(*)::int AS count FROM transactions WHERE status = 'refund_failed'`);
+  return result.rows[0].count;
+}
+
+// Claims a failed refund for an admin's "retry now" (status 'refunding'), so it can't run
+// at the same time as the retry job or another admin's click. True only for the winner.
+export async function claimFailedRefundForRetry(paymentId) {
+  const result = await pool.query(
+    `
+    UPDATE transactions
+    SET status = 'refunding', updated_at = NOW()
+    WHERE payment_id = $1 AND status = 'refund_failed'
+    RETURNING payment_id
+    `,
+    [String(paymentId)]
+  );
+  return result.rowCount > 0;
+}
+
+// Closes a failed refund by hand: 'refunded_manually' (the money went back some other
+// way, e.g. a bank transfer) or 'refund_discarded' (nothing to give back, e.g. test data).
+// Resolves to the updated transaction, or null if it wasn't a failed refund (anymore).
+export async function resolveFailedRefund(paymentId, status, note, adminId) {
+  const result = await pool.query(
+    `
+    UPDATE transactions
+    SET
+      status = $2,
+      refund_resolution_note = $3,
+      refund_resolved_by = $4,
+      refund_resolved_at = NOW(),
+      updated_at = NOW()
+    WHERE payment_id = $1 AND status = 'refund_failed'
+    RETURNING *
+    `,
+    [String(paymentId), status, note, adminId]
+  );
+  return result.rows[0] || null;
 }

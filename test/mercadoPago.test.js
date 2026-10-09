@@ -93,4 +93,32 @@ describe('MercadoPago Module', () => {
       expect(result.status).toBe('refunded');
     });
   });
+
+  describe('describeRefundError', () => {
+    it('reads "Unauthorized use of live credentials" as a test-user payment, never retryable', () => {
+      const failure = mp.describeRefundError({
+        message: 'Unauthorized use of live credentials', error: 'unauthorized', status: 401,
+        cause: [{ code: 7, description: 'Unauthorized use of live credentials' }],
+      });
+      expect(failure).toEqual(expect.objectContaining({ code: 'test_payment', permanent: true }));
+      expect(failure.detail).toContain('live credentials');
+    });
+
+    it('reads a payment Mercado Pago does not know as not found, never retryable', () => {
+      expect(mp.describeRefundError({ error: 'resource not found', message: 'Si quieres conocer los recursos...' }))
+        .toEqual(expect.objectContaining({ code: 'payment_not_found', permanent: true }));
+    });
+
+    it('reads other 401/403s as unauthorized, never retryable', () => {
+      expect(mp.describeRefundError({ status: 403, message: 'forbidden' }))
+        .toEqual(expect.objectContaining({ code: 'unauthorized', permanent: true }));
+    });
+
+    it('treats timeouts, outages and anything unknown as transient, worth retrying', () => {
+      expect(mp.describeRefundError(new Error('timeout of 10000ms exceeded')))
+        .toEqual({ code: 'transient', permanent: false, detail: 'timeout of 10000ms exceeded' });
+      expect(mp.describeRefundError({ status: 500, message: 'internal error' }).code).toBe('transient');
+      expect(mp.describeRefundError(undefined).code).toBe('transient');
+    });
+  });
 });

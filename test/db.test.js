@@ -92,4 +92,51 @@ describe('DB Module', () => {
       expect(result).toBe(300);
     });
   });
+
+  describe('failed refunds', () => {
+    it('flags a failed refund with why, and reports whether there was a transaction to flag', async () => {
+      pool.query.mockResolvedValueOnce({ rowCount: 1 });
+      const tracked = await db.markTransactionAsRefundFailed('pay1', { code: 'transient', permanent: false, detail: 'timeout' }, 5);
+      expect(tracked).toBe(true);
+      expect(pool.query.mock.calls[0][1]).toEqual(['pay1', 'transient', false, 5, 'timeout']);
+
+      pool.query.mockResolvedValueOnce({ rowCount: 0 });
+      expect(await db.markTransactionAsRefundFailed('missing')).toBe(false);
+      expect(pool.query.mock.calls[1][1]).toEqual(['missing', null, false, 0, null]);
+    });
+
+    it('jumps a permanent failure straight to the retry cutoff', async () => {
+      pool.query.mockResolvedValueOnce({ rowCount: 1 });
+      await db.markTransactionAsRefundFailed('pay1', { code: 'test_payment', permanent: true, detail: 'live credentials' }, 5);
+      expect(pool.query.mock.calls[0][0]).toContain('GREATEST(refund_attempts + 1, $4)');
+      expect(pool.query.mock.calls[0][1][2]).toBe(true);
+    });
+
+    it('lists and counts only refunds still owed', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [{ payment_id: 'pay1' }] });
+      expect(await db.listFailedRefunds()).toEqual([{ payment_id: 'pay1' }]);
+      expect(pool.query.mock.calls[0][0]).toContain("status = 'refund_failed'");
+
+      pool.query.mockResolvedValueOnce({ rows: [{ count: 2 }] });
+      expect(await db.countFailedRefunds()).toBe(2);
+    });
+
+    it('claims a failed refund for a manual retry only while it is still failed', async () => {
+      pool.query.mockResolvedValueOnce({ rowCount: 1 });
+      expect(await db.claimFailedRefundForRetry('pay1')).toBe(true);
+      expect(pool.query.mock.calls[0][0]).toContain("status = 'refund_failed'");
+      pool.query.mockResolvedValueOnce({ rowCount: 0 });
+      expect(await db.claimFailedRefundForRetry('pay1')).toBe(false);
+    });
+
+    it('resolves a failed refund by hand with who, why and when', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [{ payment_id: 'pay1', status: 'refund_discarded' }] });
+      const resolved = await db.resolveFailedRefund('pay1', 'refund_discarded', 'test data', 'admin-1');
+      expect(resolved).toEqual({ payment_id: 'pay1', status: 'refund_discarded' });
+      expect(pool.query.mock.calls[0][1]).toEqual(['pay1', 'refund_discarded', 'test data', 'admin-1']);
+
+      pool.query.mockResolvedValueOnce({ rows: [] });
+      expect(await db.resolveFailedRefund('pay1', 'refund_discarded', 'x', 'admin-1')).toBeNull();
+    });
+  });
 });

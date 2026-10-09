@@ -13,7 +13,11 @@ jest.unstable_mockModule('../src/db.js', () => ({
   getTransactionAmountByPeriod: jest.fn(),
   claimTransactionForRefund: jest.fn(),
   markTransactionAsRefundedByPaymentId: jest.fn(),
-  markTransactionAsRefundFailed: jest.fn()
+  markTransactionAsRefundFailed: jest.fn(),
+  listFailedRefunds: jest.fn(),
+  countFailedRefunds: jest.fn(),
+  claimFailedRefundForRetry: jest.fn(),
+  resolveFailedRefund: jest.fn()
 }));
 
 jest.unstable_mockModule('../src/bookingClient.js', () => ({
@@ -25,7 +29,10 @@ jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   createCheckoutPreference: jest.fn(),
   getPaymentById: jest.fn(),
   refundPayment: jest.fn(),
-  searchPaymentByExternalReference: jest.fn()
+  searchPaymentByExternalReference: jest.fn(),
+  // The real classification is covered in mercadoPago.test.js; here every failure reads
+  // as a test-user payment.
+  describeRefundError: jest.fn(() => ({ code: 'test_payment', permanent: true, detail: 'Unauthorized use of live credentials' }))
 }));
 
 const {
@@ -37,7 +44,11 @@ const {
   getTransactionAmountByPeriod,
   claimTransactionForRefund,
   markTransactionAsRefundedByPaymentId,
-  markTransactionAsRefundFailed
+  markTransactionAsRefundFailed,
+  listFailedRefunds,
+  countFailedRefunds,
+  claimFailedRefundForRetry,
+  resolveFailedRefund
 } = await import('../src/db.js');
 
 const { getBooking, confirmBooking } = await import('../src/bookingClient.js');
@@ -267,7 +278,7 @@ describe('Payment Service App', () => {
         .set(getValidHeaders('123'))
         .send({ type: 'payment', data: { id: '123' } });
 
-      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('123');
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('123', expect.objectContaining({ code: 'test_payment' }), 5);
       expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
     });
 
@@ -429,6 +440,22 @@ describe('Payment Service App', () => {
       expect(res.body.status).toBe('delayed');
     });
 
+    it('reports a refund an admin returned by hand as refunded, dated when they closed it', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({
+        status: 'refunded_manually', amount: '1500.00', updated_at: '2026-10-09T10:00:00Z', refund_resolved_at: '2026-10-09T09:00:00Z',
+      });
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.body).toEqual({ status: 'refunded', amount: 1500, refundedAt: '2026-10-09T09:00:00Z' });
+    });
+
+    it('reports a discarded refund (nothing owed, e.g. test data) as no refund', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({ status: 'refund_discarded', amount: '1500.00' });
+      const res = await refundStatus(DRIVER_ID);
+      expect(res.body.status).toBe('none');
+    });
+
     it('is only for the booking\'s own driver', async () => {
       getBooking.mockResolvedValueOnce(ownBooking({ user_id: 'someone-else' }));
       const res = await refundStatus(DRIVER_ID);
@@ -515,26 +542,165 @@ describe('Payment Service App', () => {
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
     });
 
-    it('flags the transaction for manual review when a real Mercado Pago refund fails, instead of marking it refunded', async () => {
-      // refundPayment() itself already no-ops for known-fake ids (mock-/
-      // seed-demo- prefixes, see mercadoPago.test.js) -- a rejection
-      // reaching this handler means a real payment genuinely failed to
-      // refund, so it must NOT be reported as success.
+    it('accepts a refund Mercado Pago fails as owed (202), flagging it with why, instead of marking it refunded', async () => {
+      // refundPayment() itself already no-ops for known-fake ids (mock-/seed-demo- prefixes,
+      // see mercadoPago.test.js) -- a rejection reaching this handler means a real payment
+      // failed to refund. The cancellation that asked for it went through, so it's not an
+      // error for booking-service: the refund is on record for the retry job and the admin.
       refundPayment.mockRejectedValueOnce(new Error('Unauthorized use of live credentials'));
-      markTransactionAsRefundFailed.mockResolvedValueOnce();
+      markTransactionAsRefundFailed.mockResolvedValueOnce(true);
 
       const res = await request(app)
         .post('/internal/refund-by-payment')
         .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
         .send({ payment_id: '178591399221' });
 
-      expect(res.status).toBe(502);
-      expect(res.body).toEqual({
-        success: false,
-        detail: 'Mercado Pago refund failed; transaction flagged for manual review',
-      });
-      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('178591399221');
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ success: false, queued: true, code: 'test_payment' });
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith(
+        '178591399221', expect.objectContaining({ code: 'test_payment', permanent: true }), 5,
+      );
       expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+
+    it('still fails (502) when there is no transaction to flag, so nobody would follow up', async () => {
+      refundPayment.mockRejectedValueOnce(new Error('MP down'));
+      markTransactionAsRefundFailed.mockResolvedValueOnce(false);
+
+      const res = await request(app)
+        .post('/internal/refund-by-payment')
+        .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
+        .send({ payment_id: 'unknown' });
+
+      expect(res.status).toBe(502);
+      expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('admin failed refunds', () => {
+    let adminToken;
+    let userToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin', sub: 'admin-1' }, process.env.JWT_SECRET);
+      userToken = jwt.sign({ sub: 'user-1' }, process.env.JWT_SECRET);
+    });
+    const asAdmin = (req) => req.set('Authorization', `Bearer ${adminToken}`);
+
+    it('is admin-only', async () => {
+      const res = await request(app).get('/admin/refunds').set('Authorization', `Bearer ${userToken}`);
+      expect(res.status).toBe(403);
+      expect(listFailedRefunds).not.toHaveBeenCalled();
+    });
+
+    it('lists every refund still owed, with its booking and why it failed', async () => {
+      listFailedRefunds.mockResolvedValueOnce([
+        {
+          payment_id: '182168894549', external_reference: 'booking-1', amount: '8640.00', currency: 'ARS',
+          payer_email: 'driver@test.com', approved_at: '2026-10-08T20:00:00Z', refund_attempts: 5,
+          refund_error_code: 'test_payment', refund_last_error: 'Unauthorized use of live credentials',
+          updated_at: '2026-10-09T02:33:56Z',
+        },
+        {
+          payment_id: '999', external_reference: 'booking-2', amount: '1000.00', currency: 'ARS',
+          payer_email: null, approved_at: null, refund_attempts: 1,
+          refund_error_code: 'transient', refund_last_error: 'timeout', updated_at: '2026-10-09T01:00:00Z',
+        },
+      ]);
+      getBooking.mockImplementation((id) =>
+        id === 'booking-1' ? Promise.resolve({ id: 'booking-1', user_id: 'driver-1' }) : Promise.reject(new Error('down')),
+      );
+      jest.spyOn(console, 'warn').mockImplementationOnce(() => {});
+
+      const res = await asAdmin(request(app).get('/admin/refunds'));
+
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(2);
+      expect(res.body.items[0]).toEqual({
+        paymentId: '182168894549', bookingId: 'booking-1', amount: 8640, currency: 'ARS',
+        payerEmail: 'driver@test.com', approvedAt: '2026-10-08T20:00:00Z', attempts: 5, retriesExhausted: true,
+        errorCode: 'test_payment', lastError: 'Unauthorized use of live credentials', failedAt: '2026-10-09T02:33:56Z',
+        booking: { id: 'booking-1', user_id: 'driver-1' },
+      });
+      // A booking that can't be loaded doesn't hide the refund.
+      expect(res.body.items[1]).toEqual(expect.objectContaining({ paymentId: '999', booking: null, retriesExhausted: false }));
+      getBooking.mockReset();
+    });
+
+    it('counts the refunds still owed', async () => {
+      countFailedRefunds.mockResolvedValueOnce(3);
+      const res = await asAdmin(request(app).get('/admin/refunds/count'));
+      expect(res.body).toEqual({ count: 3 });
+    });
+
+    it('retries a refund now and marks it refunded when Mercado Pago accepts it', async () => {
+      claimFailedRefundForRetry.mockResolvedValueOnce(true);
+      refundPayment.mockResolvedValueOnce({ status: 'refunded' });
+
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/retry'));
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: 'refunded' });
+      expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
+    });
+
+    it('keeps a retried refund flagged, with why, when Mercado Pago fails it again', async () => {
+      claimFailedRefundForRetry.mockResolvedValueOnce(true);
+      refundPayment.mockRejectedValueOnce(new Error('Unauthorized use of live credentials'));
+      jest.spyOn(console, 'error').mockImplementationOnce(() => {});
+
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/retry'));
+
+      expect(res.status).toBe(502);
+      expect(res.body.code).toBe('test_payment');
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('pay1', expect.objectContaining({ code: 'test_payment' }), 5);
+      expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+
+    it('does not retry a refund that is no longer pending (already retried or resolved)', async () => {
+      claimFailedRefundForRetry.mockResolvedValueOnce(false);
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/retry'));
+      expect(res.status).toBe(409);
+      expect(refundPayment).not.toHaveBeenCalled();
+    });
+
+    it('discards a refund with a note, recording who did it', async () => {
+      resolveFailedRefund.mockResolvedValueOnce({ status: 'refund_discarded' });
+
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve'))
+        .send({ resolution: 'discarded', note: 'Pago de prueba de Mercado Pago' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ status: 'refund_discarded' });
+      expect(resolveFailedRefund).toHaveBeenCalledWith('pay1', 'refund_discarded', 'Pago de prueba de Mercado Pago', 'admin-1');
+    });
+
+    it('requires a note to discard a refund', async () => {
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve')).send({ resolution: 'discarded', note: ' ' });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('NOTE_REQUIRED');
+      expect(resolveFailedRefund).not.toHaveBeenCalled();
+    });
+
+    it('marks a refund as returned by hand, note optional', async () => {
+      resolveFailedRefund.mockResolvedValueOnce({ status: 'refunded_manually' });
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve')).send({ resolution: 'refunded_manually' });
+      expect(res.status).toBe(200);
+      expect(resolveFailedRefund).toHaveBeenCalledWith('pay1', 'refunded_manually', null, 'admin-1');
+    });
+
+    it('rejects an unknown resolution, including inherited object keys', async () => {
+      for (const resolution of ['refunded', 'constructor', undefined]) {
+        const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve')).send({ resolution, note: 'x x x' });
+        expect(res.status).toBe(400);
+      }
+      expect(resolveFailedRefund).not.toHaveBeenCalled();
+    });
+
+    it('reports a refund that is no longer pending', async () => {
+      resolveFailedRefund.mockResolvedValueOnce(null);
+      const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve')).send({ resolution: 'refunded_manually' });
+      expect(res.status).toBe(409);
     });
   });
 });

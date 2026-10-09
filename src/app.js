@@ -3,16 +3,21 @@ import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
 import {
+  claimFailedRefundForRetry,
   claimTransactionForRefund,
+  countFailedRefunds,
   getTransactionByExternalReference,
   getTransactionByPaymentId,
   pool,
   saveTransaction,
+  listFailedRefunds,
   markTransactionAsRefundedByPaymentId,
   markTransactionAsRefundFailed,
+  resolveFailedRefund,
 } from './db.js';
 import {
   createCheckoutPreference,
+  describeRefundError,
   getPaymentById,
   refundPayment,
   searchPaymentByExternalReference,
@@ -112,7 +117,7 @@ async function refundUnbookablePayment(paymentId, reason) {
     console.warn(`[Payment] Refunded payment ${paymentId}: booking refused it (${reason})`);
   } catch (error) {
     console.error(`[Payment] Automatic refund of payment ${paymentId} failed, flagged for retry:`, error);
-    await markTransactionAsRefundFailed(paymentId);
+    await markTransactionAsRefundFailed(paymentId, describeRefundError(error), config.refundRetryMaxAttempts);
   }
 }
 
@@ -508,8 +513,10 @@ export function createApp() {
       // "in progress" -- it's waiting on someone from ParkLink, and the driver should know.
       const retriesExhausted =
         transaction.status === 'refund_failed' && Number(transaction.refund_attempts) >= config.refundRetryMaxAttempts;
+      // Refunded by hand (outside Mercado Pago) counts as refunded; a discarded one (an
+      // admin decided nothing is owed, e.g. test data) as no refund at all.
       const status =
-        transaction.status === 'refunded'
+        transaction.status === 'refunded' || transaction.status === 'refunded_manually'
           ? 'refunded'
           : retriesExhausted
             ? 'delayed'
@@ -519,7 +526,7 @@ export function createApp() {
       return res.json({
         status,
         amount: Number(transaction.amount),
-        refundedAt: status === 'refunded' ? transaction.updated_at : null,
+        refundedAt: status === 'refunded' ? transaction.refund_resolved_at ?? transaction.updated_at : null,
       });
     } catch (error) {
       console.error('[Payment Service] Error fetching refund status:', error);
@@ -527,10 +534,10 @@ export function createApp() {
     }
   });
 
-  // Triggered by booking-service when an owner rejects (or never responds to)
-  // a booking that requires their approval -- not gateway-routed, protected
-  // by a shared internal key instead of a user's JWT (same "this port is
-  // directly reachable" reasoning as demo-pay/refund above).
+  // Triggered by booking-service whenever a paid booking is called off (the owner rejects
+  // it or never answers, the driver cancels, an account closes, an admin refunds an
+  // unverified stay) -- not gateway-routed, protected by a shared internal key instead of
+  // a user's JWT (same "this port is directly reachable" reasoning as demo-pay above).
   app.post('/internal/refund-by-payment', requireInternalKey, async (req, res) => {
     try {
       const { payment_id } = req.body;
@@ -538,17 +545,23 @@ export function createApp() {
       try {
         await refundPayment(payment_id);
       } catch (error) {
-        // refundPayment() already no-ops for known-fake ids (mock-/seed-demo-
-        // prefixes, see mercadoPago.js), so reaching here means a REAL
-        // payment genuinely failed to refund on Mercado Pago's side (e.g.
-        // the account isn't enabled for live money movement) -- marking it
-        // "refunded" anyway would be a lie the app and support team would
-        // trust. Flag it for manual review instead.
+        // refundPayment() already no-ops for known-fake ids (mock-/seed-demo- prefixes,
+        // see mercadoPago.js), so reaching here means a REAL payment failed to refund on
+        // Mercado Pago's side -- marking it "refunded" anyway would be a lie the app and
+        // support team would trust. It's flagged refund_failed instead: the retry job
+        // tries again, and the admin panel lists it until someone resolves it.
         console.error('[Payment] Mercado Pago refund failed for a real payment, marking refund_failed:', error);
-        await markTransactionAsRefundFailed(payment_id);
+        const failure = describeRefundError(error);
+        const tracked = await markTransactionAsRefundFailed(payment_id, failure, config.refundRetryMaxAttempts);
+        if (tracked) {
+          // 202: the refund is owed and on record -- the cancellation that asked for it
+          // went through, so booking-service must not report it to its user as an error.
+          return res.status(202).json({ success: false, queued: true, code: failure.code });
+        }
+        // No transaction here to flag: nobody would ever follow up on it.
         return res.status(502).json({
           success: false,
-          detail: 'Mercado Pago refund failed; transaction flagged for manual review',
+          detail: 'Mercado Pago refund failed and there is no transaction to flag for follow-up',
         });
       }
 
@@ -560,6 +573,108 @@ export function createApp() {
       res.status(500).json({
         detail: 'Failed to refund payment'
       });
+    }
+  });
+
+  // -- Failed refunds, ParkLink-staff side (admin panel's "Reembolsos pendientes") --
+  // Gateway-routed as /admin/refunds/* (ADMIN): every refund still owed to a driver, with
+  // the booking it belongs to, and the ways to close one.
+
+  app.get('/admin/refunds/count', requireAdmin, async (_req, res) => {
+    try {
+      return res.json({ count: await countFailedRefunds() });
+    } catch (error) {
+      console.error('[Refunds] Error counting failed refunds:', error);
+      return res.status(500).json({ detail: 'Error counting failed refunds' });
+    }
+  });
+
+  app.get('/admin/refunds', requireAdmin, async (_req, res) => {
+    try {
+      const rows = await listFailedRefunds();
+      // The booking each one paid for (whose it is, which spot, when) -- best effort: a
+      // booking-service hiccup just leaves it out, the refund itself still shows.
+      const items = await Promise.all(
+        rows.map(async (row) => {
+          let booking = null;
+          if (row.external_reference) {
+            try {
+              booking = await getBooking(row.external_reference);
+            } catch (error) {
+              console.warn(`[Refunds] Could not load booking ${row.external_reference}:`, error.message);
+            }
+          }
+          return {
+            paymentId: row.payment_id,
+            bookingId: row.external_reference,
+            amount: Number(row.amount),
+            currency: row.currency,
+            payerEmail: row.payer_email,
+            approvedAt: row.approved_at,
+            attempts: Number(row.refund_attempts),
+            retriesExhausted: Number(row.refund_attempts) >= config.refundRetryMaxAttempts,
+            errorCode: row.refund_error_code,
+            lastError: row.refund_last_error,
+            failedAt: row.updated_at,
+            booking,
+          };
+        }),
+      );
+      return res.json({ items });
+    } catch (error) {
+      console.error('[Refunds] Error listing failed refunds:', error);
+      return res.status(500).json({ detail: 'Error listing failed refunds' });
+    }
+  });
+
+  // "Reintentar": asks Mercado Pago again, right now.
+  app.post('/admin/refunds/:paymentId/retry', requireAdmin, async (req, res) => {
+    const { paymentId } = req.params;
+    try {
+      if (!(await claimFailedRefundForRetry(paymentId))) {
+        return res.status(409).json({ code: 'NOT_PENDING', detail: 'Este reembolso ya no está pendiente.' });
+      }
+      try {
+        await refundPayment(paymentId);
+      } catch (error) {
+        const failure = describeRefundError(error);
+        console.error(`[Refunds] Manual retry of payment ${paymentId} failed:`, error);
+        await markTransactionAsRefundFailed(paymentId, failure, config.refundRetryMaxAttempts);
+        return res.status(502).json({ code: failure.code, detail: failure.detail });
+      }
+      await markTransactionAsRefundedByPaymentId(paymentId);
+      console.log(`[Refunds] Payment ${paymentId} refunded on a manual retry by admin ${req.user?.sub}`);
+      return res.json({ status: 'refunded' });
+    } catch (error) {
+      console.error('[Refunds] Error retrying refund:', error);
+      return res.status(500).json({ detail: 'Error retrying refund' });
+    }
+  });
+
+  // Closes one by hand: "refunded_manually" (the money went back some other way) or
+  // "discarded" (nothing to give back, e.g. test data). A note is required to discard.
+  const RESOLUTIONS = new Map([['refunded_manually', 'refunded_manually'], ['discarded', 'refund_discarded']]);
+  app.post('/admin/refunds/:paymentId/resolve', requireAdmin, async (req, res) => {
+    try {
+      const status = RESOLUTIONS.get(String(req.body?.resolution ?? ''));
+      if (!status) {
+        return res.status(400).json({ code: 'INVALID_RESOLUTION', detail: 'resolution must be refunded_manually or discarded' });
+      }
+      const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 1000) : '';
+      if (status === 'refund_discarded' && note.length < 3) {
+        return res.status(400).json({ code: 'NOTE_REQUIRED', detail: 'Contá por qué se descarta este reembolso.' });
+      }
+      // Who closed it, as the panel shows people: the admin's username (from their token).
+      const adminId = String(req.user?.admin_username || req.user?.sub || '');
+      const resolved = await resolveFailedRefund(req.params.paymentId, status, note || null, adminId);
+      if (!resolved) {
+        return res.status(409).json({ code: 'NOT_PENDING', detail: 'Este reembolso ya no está pendiente.' });
+      }
+      console.log(`[Refunds] Payment ${req.params.paymentId} closed as ${status} by admin ${adminId}`);
+      return res.json({ status: resolved.status });
+    } catch (error) {
+      console.error('[Refunds] Error resolving refund:', error);
+      return res.status(500).json({ detail: 'Error resolving refund' });
     }
   });
 

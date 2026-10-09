@@ -11,8 +11,11 @@ jest.unstable_mockModule('../src/db.js', () => ({
   markTransactionAsRefundFailed,
 }));
 
+const describeRefundError = jest.fn((error) => ({ code: 'transient', permanent: false, detail: error.message }));
+
 jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   refundPayment,
+  describeRefundError,
 }));
 
 let job;
@@ -56,7 +59,9 @@ describe('refundRetryJob', () => {
 
       await job.retryFailedRefunds();
 
-      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('pay_2');
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith(
+        'pay_2', { code: 'transient', permanent: false, detail: 'Mercado Pago is down' }, 5,
+      );
       expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
     });
 
@@ -73,7 +78,7 @@ describe('refundRetryJob', () => {
 
       expect(count).toBe(2);
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay_ok');
-      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('pay_bad');
+      expect(markTransactionAsRefundFailed).toHaveBeenCalledWith('pay_bad', expect.objectContaining({ code: 'transient' }), 5);
     });
   });
 
