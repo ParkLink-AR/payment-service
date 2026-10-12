@@ -6,6 +6,7 @@
 import { config } from './config.js';
 import { listRefundFailedTransactions, markTransactionAsRefundedByPaymentId, markTransactionAsRefundFailed } from './db.js';
 import { describeRefundError, refundPayment } from './mercadoPago.js';
+import { announceRefundCompleted } from './events.js';
 
 export async function retryFailedRefunds() {
   const pending = await listRefundFailedTransactions(config.refundRetryMaxAttempts);
@@ -14,6 +15,7 @@ export async function retryFailedRefunds() {
       await refundPayment(paymentId);
       await markTransactionAsRefundedByPaymentId(paymentId);
       console.log(`[RefundRetry] Refunded payment ${paymentId} on retry`);
+      await announceRefundCompleted(paymentId, 'mercadopago');
     } catch (error) {
       // Still failing -- markTransactionAsRefundFailed bumps refund_attempts, so once it
       // hits config.refundRetryMaxAttempts this same transaction stops being picked up by

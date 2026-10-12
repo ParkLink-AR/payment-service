@@ -25,6 +25,7 @@ import {
 import { confirmBooking, getBooking } from './bookingClient.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
 import { requireAdmin, requireInternalKey, requireGatewaySecret } from './security.js';
+import { announceRefundCompleted } from './events.js';
 
 function normalizeHeaderValue(value) {
   if (Array.isArray(value)) {
@@ -644,6 +645,7 @@ export function createApp() {
       }
       await markTransactionAsRefundedByPaymentId(paymentId);
       console.log(`[Refunds] Payment ${paymentId} refunded on a manual retry by admin ${req.user?.sub}`);
+      await announceRefundCompleted(paymentId, 'mercadopago');
       return res.json({ status: 'refunded' });
     } catch (error) {
       console.error('[Refunds] Error retrying refund:', error);
@@ -671,6 +673,8 @@ export function createApp() {
         return res.status(409).json({ code: 'NOT_PENDING', detail: 'Este reembolso ya no está pendiente.' });
       }
       console.log(`[Refunds] Payment ${req.params.paymentId} closed as ${status} by admin ${adminId}`);
+      // Returned by hand: the driver is told. A discarded one (nothing owed) isn't.
+      if (status === 'refunded_manually') await announceRefundCompleted(req.params.paymentId, 'manual');
       return res.json({ status: resolved.status });
     } catch (error) {
       console.error('[Refunds] Error resolving refund:', error);

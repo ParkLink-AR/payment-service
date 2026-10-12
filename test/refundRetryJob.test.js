@@ -18,6 +18,9 @@ jest.unstable_mockModule('../src/mercadoPago.js', () => ({
   describeRefundError,
 }));
 
+const announceRefundCompleted = jest.fn();
+jest.unstable_mockModule('../src/events.js', () => ({ announceRefundCompleted }));
+
 let job;
 
 describe('refundRetryJob', () => {
@@ -51,6 +54,7 @@ describe('refundRetryJob', () => {
       expect(refundPayment).toHaveBeenCalledWith('pay_1');
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay_1');
       expect(markTransactionAsRefundFailed).not.toHaveBeenCalled();
+      expect(announceRefundCompleted).toHaveBeenCalledWith('pay_1', 'mercadopago');
     });
 
     it('leaves a transaction flagged (with a bumped attempt count) when the retry fails too', async () => {

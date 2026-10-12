@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@mercadopago/sdk-react": "^1.0.7",
+    "amqplib": "^0.10.9",
     "cors": "^2.8.6",
     "dd-trace": "^5.110.0",
     "dotenv": "^16.4.5",

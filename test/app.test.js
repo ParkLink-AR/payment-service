@@ -20,6 +20,9 @@ jest.unstable_mockModule('../src/db.js', () => ({
   resolveFailedRefund: jest.fn()
 }));
 
+const announceRefundCompleted = jest.fn();
+jest.unstable_mockModule('../src/events.js', () => ({ announceRefundCompleted }));
+
 jest.unstable_mockModule('../src/bookingClient.js', () => ({
   getBooking: jest.fn(),
   confirmBooking: jest.fn()
@@ -642,6 +645,8 @@ describe('Payment Service App', () => {
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ status: 'refunded' });
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
+      // The driver is told their money finally reached them.
+      expect(announceRefundCompleted).toHaveBeenCalledWith('pay1', 'mercadopago');
     });
 
     it('keeps a retried refund flagged, with why, when Mercado Pago fails it again', async () => {
@@ -673,6 +678,8 @@ describe('Payment Service App', () => {
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ status: 'refund_discarded' });
       expect(resolveFailedRefund).toHaveBeenCalledWith('pay1', 'refund_discarded', 'Pago de prueba de Mercado Pago', 'admin-1');
+      // Nothing was owed: no notice to the driver.
+      expect(announceRefundCompleted).not.toHaveBeenCalled();
     });
 
     it('requires a note to discard a refund', async () => {
@@ -687,6 +694,7 @@ describe('Payment Service App', () => {
       const res = await asAdmin(request(app).post('/admin/refunds/pay1/resolve')).send({ resolution: 'refunded_manually' });
       expect(res.status).toBe(200);
       expect(resolveFailedRefund).toHaveBeenCalledWith('pay1', 'refunded_manually', null, 'admin-1');
+      expect(announceRefundCompleted).toHaveBeenCalledWith('pay1', 'manual');
     });
 
     it('rejects an unknown resolution, including inherited object keys', async () => {
