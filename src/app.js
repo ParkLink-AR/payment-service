@@ -105,6 +105,10 @@ function verifyMercadoPagoWebhookSignature(req) {
 // already paid / isn't awaiting payment). The money moved, so it goes straight back.
 const REFUNDABLE_CONFIRM_ERRORS = new Set(['HOLD_EXPIRED', 'AMOUNT_MISMATCH', 'BOOKING_NOT_PAYABLE']);
 
+// A payment attempt that ended without charging: the driver can still pay the same booking
+// with a new one while its hold lasts.
+const RETRYABLE_PAYMENT_STATUSES = new Set(['rejected', 'cancelled']);
+
 // Refunds an approved payment that has no booking to pay for. Claimed atomically first
 // (see claimTransactionForRefund) so the webhook and the app's polling can't both refund
 // it; a Mercado Pago failure is flagged refund_failed for refundRetryJob.js to retry.
@@ -458,6 +462,21 @@ export function createApp() {
           }
         } catch (error) {
           console.log(`[Payment Verify] Search by externalReference ${externalReference} failed:`, error.message);
+        }
+      }
+
+      // The driver can go back to the checkout and try again (e.g. after a declined card):
+      // a newer attempt for the same booking may exist on Mercado Pago that the webhook
+      // hasn't saved yet, and the old failed one mustn't hide it.
+      if (transaction && RETRYABLE_PAYMENT_STATUSES.has(payment?.status || transaction.status)) {
+        try {
+          const latest = await searchPaymentByExternalReference(externalReference);
+          if (latest && String(latest.id) !== String(transaction.payment_id)) {
+            payment = latest;
+            transaction = await saveTransaction(latest);
+          }
+        } catch (error) {
+          console.log(`[Payment Verify] Search for a newer attempt on ${externalReference} failed:`, error.message);
         }
       }
 

@@ -405,6 +405,34 @@ describe('Payment Service App', () => {
       expect(confirmBooking).toHaveBeenCalledWith('booking-1', 'mp-1', 150000);
     });
 
+    it('picks up a newer attempt after a rejected one (the driver went back to the checkout)', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({ payment_id: 'mp-old', status: 'rejected' });
+      getPaymentById.mockResolvedValueOnce({ id: 'mp-old', status: 'rejected' });
+      searchPaymentByExternalReference.mockResolvedValueOnce({
+        id: 'mp-new', status: 'approved', external_reference: 'booking-1', transaction_amount: 1500,
+      });
+      saveTransaction.mockResolvedValueOnce({ payment_id: 'mp-new', status: 'approved' });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
+
+      const res = await verify({ externalReference: 'booking-1' });
+
+      expect(res.body.currentStatus).toBe('approved');
+      expect(confirmBooking).toHaveBeenCalledWith('booking-1', 'mp-new', 150000);
+    });
+
+    it('keeps reporting a rejected attempt while there is no newer one', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({ payment_id: 'mp-old', status: 'rejected' });
+      getPaymentById.mockResolvedValueOnce({ id: 'mp-old', status: 'rejected' });
+      searchPaymentByExternalReference.mockResolvedValueOnce({ id: 'mp-old', status: 'rejected' });
+
+      const res = await verify({ externalReference: 'booking-1' });
+
+      expect(res.body.currentStatus).toBe('rejected');
+      expect(saveTransaction).not.toHaveBeenCalled();
+    });
+
     it('returns 404 when the MP search fallback also finds nothing', async () => {
       getBooking.mockResolvedValueOnce(ownBooking());
       getTransactionByExternalReference.mockResolvedValueOnce(null);
