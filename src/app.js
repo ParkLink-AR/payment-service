@@ -12,6 +12,8 @@ import {
   saveTransaction,
   listFailedRefunds,
   markTransactionAsRefundedByPaymentId,
+  addPartialRefund,
+  listTransactions,
   markTransactionAsRefundFailed,
   resolveFailedRefund,
 } from './db.js';
@@ -560,7 +562,26 @@ export function createApp() {
   // a user's JWT (same "this port is directly reachable" reasoning as demo-pay above).
   app.post('/internal/refund-by-payment', requireInternalKey, async (req, res) => {
     try {
-      const { payment_id } = req.body;
+      const { payment_id, amount_centavos } = req.body;
+
+      // An admin giving back only part of the payment (booking-service sends centavos).
+      if (amount_centavos !== undefined && amount_centavos !== null) {
+        const amount = Number(amount_centavos) / 100;
+        if (!Number.isFinite(amount) || amount <= 0) {
+          return res.status(400).json({ detail: 'amount_centavos must be positive' });
+        }
+        try {
+          await refundPayment(payment_id, amount);
+        } catch (error) {
+          // Not queued for the retry job: it only knows how to refund a payment in full,
+          // which would give back more than the admin decided. The admin sees the error and
+          // tries again.
+          console.error('[Payment] Mercado Pago partial refund failed:', error);
+          return res.status(502).json({ success: false, detail: 'Mercado Pago rechazó el reembolso parcial.' });
+        }
+        await addPartialRefund(payment_id, amount);
+        return res.json({ success: true, partial: true });
+      }
 
       try {
         await refundPayment(payment_id);
@@ -599,6 +620,52 @@ export function createApp() {
   // -- Failed refunds, ParkLink-staff side (admin panel's "Reembolsos pendientes") --
   // Gateway-routed as /admin/refunds/* (ADMIN): every refund still owed to a driver, with
   // the booking it belongs to, and the ways to close one.
+
+  // -- Every payment, ParkLink-staff side (admin panel's "Pagos") --
+  // Each with the booking it paid for, flagging an approved payment whose booking never got
+  // confirmed (a reconciliation problem staff need to look at).
+  app.get('/admin/payments', requireAdmin, async (req, res) => {
+    try {
+      const { rows, total } = await listTransactions({
+        status: req.query.status ? String(req.query.status) : undefined,
+        query: req.query.q ? String(req.query.q) : undefined,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      });
+      const items = await Promise.all(
+        rows.map(async (row) => {
+          let booking = null;
+          if (row.external_reference) {
+            try {
+              booking = await getBooking(row.external_reference);
+            } catch (error) {
+              console.warn(`[Payments] Could not load booking ${row.external_reference}:`, error.message);
+            }
+          }
+          const bookingStatus = booking?.status ?? null;
+          return {
+            paymentId: row.payment_id,
+            bookingId: row.external_reference,
+            amount: Number(row.amount),
+            refundedAmount: Number(row.refunded_amount),
+            currency: row.currency,
+            status: row.status,
+            payerEmail: row.payer_email,
+            approvedAt: row.approved_at,
+            createdAt: row.created_at,
+            bookingStatus,
+            // Mercado Pago took the money but the booking isn't paid on our side.
+            needsAttention:
+              row.status === 'approved' && (!booking || ['PENDING_PAYMENT', 'EXPIRED'].includes(bookingStatus)),
+          };
+        })
+      );
+      return res.json({ items, total });
+    } catch (error) {
+      console.error('[Payments] Error listing payments:', error);
+      return res.status(500).json({ detail: 'Error listing payments' });
+    }
+  });
 
   app.get('/admin/refunds/count', requireAdmin, async (_req, res) => {
     try {

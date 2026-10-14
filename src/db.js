@@ -42,6 +42,10 @@ export async function initDatabase() {
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_resolved_by VARCHAR(64);
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refund_resolved_at TIMESTAMPTZ;
 
+    -- What an admin gave back by hand with a partial refund (pesos) -- the payment stays
+    -- 'approved' until all of it went back.
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS refunded_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
+
     CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
     CREATE INDEX IF NOT EXISTS idx_transactions_external_reference ON transactions(external_reference);
     CREATE INDEX IF NOT EXISTS idx_transactions_order_id ON transactions(order_id);
@@ -284,4 +288,41 @@ export async function resolveFailedRefund(paymentId, status, note, adminId) {
     [String(paymentId), status, note, adminId]
   );
   return result.rows[0] || null;
+}
+
+// A partial refund went through: adds it to what was already given back.
+export async function addPartialRefund(paymentId, amount) {
+  await pool.query(
+    `UPDATE transactions SET refunded_amount = refunded_amount + $2, updated_at = NOW() WHERE payment_id = $1`,
+    [String(paymentId), amount]
+  );
+}
+
+// Every payment, newest first, for the admin panel's "Pagos" screen. `status` filters by
+// Mercado Pago's status; `query` matches a payment id, a booking id or the payer's email.
+export async function listTransactions({ status, query, limit = 50, offset = 0 } = {}) {
+  const conditions = [];
+  const args = [];
+  if (status) {
+    args.push(status);
+    conditions.push(`status = $${args.length}`);
+  }
+  if (query) {
+    args.push(`%${String(query).trim().toLowerCase()}%`);
+    conditions.push(
+      `(LOWER(payment_id) LIKE $${args.length} OR LOWER(COALESCE(external_reference, '')) LIKE $${args.length} OR LOWER(COALESCE(payer_email, '')) LIKE $${args.length})`
+    );
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const total = await pool.query(`SELECT COUNT(*)::int AS count FROM transactions ${where}`, args);
+  args.push(Math.min(Math.max(Number(limit) || 50, 1), 200), Math.max(Number(offset) || 0, 0));
+  const rows = await pool.query(
+    `SELECT payment_id, external_reference, amount, currency, status, payer_email, approved_at,
+            refunded_amount, created_at, updated_at
+     FROM transactions ${where}
+     ORDER BY created_at DESC
+     LIMIT $${args.length - 1} OFFSET $${args.length}`,
+    args
+  );
+  return { rows: rows.rows, total: total.rows[0].count };
 }

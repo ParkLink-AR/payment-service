@@ -90,10 +90,14 @@ export async function getPaymentById(paymentId) {
 // prefix) or by hand-seeded test data ("seed-demo-"/"mock-" prefixes) don't exist on
 // Mercado Pago's side, so calling refund on them would always fail -- treated as a no-op
 // success instead, so only a genuinely real payment's refund failure reaches the caller.
-export async function refundPayment(paymentId) {
+// `amount` (pesos) gives back only part of the payment -- an admin's partial refund.
+export async function refundPayment(paymentId, amount) {
   const idStr = String(paymentId);
   if (idStr.startsWith('demo-') || idStr.startsWith('mock-') || idStr.startsWith('seed-demo-')) {
     return { id: idStr, status: 'refunded', mocked: true };
+  }
+  if (amount !== undefined) {
+    return refundClient.create({ payment_id: idStr, body: { amount } });
   }
   return refundClient.create({ payment_id: idStr });
 }

@@ -13,6 +13,8 @@ jest.unstable_mockModule('../src/db.js', () => ({
   getTransactionAmountByPeriod: jest.fn(),
   claimTransactionForRefund: jest.fn(),
   markTransactionAsRefundedByPaymentId: jest.fn(),
+  addPartialRefund: jest.fn(),
+  listTransactions: jest.fn(),
   markTransactionAsRefundFailed: jest.fn(),
   listFailedRefunds: jest.fn(),
   countFailedRefunds: jest.fn(),
@@ -47,6 +49,8 @@ const {
   getTransactionAmountByPeriod,
   claimTransactionForRefund,
   markTransactionAsRefundedByPaymentId,
+  addPartialRefund,
+  listTransactions,
   markTransactionAsRefundFailed,
   listFailedRefunds,
   countFailedRefunds,
@@ -573,6 +577,34 @@ describe('Payment Service App', () => {
       expect(markTransactionAsRefundedByPaymentId).toHaveBeenCalledWith('pay1');
     });
 
+    it('gives back only part of the payment when an admin asked for it (centavos -> pesos)', async () => {
+      refundPayment.mockResolvedValueOnce({ id: 'pay1', status: 'approved' });
+      addPartialRefund.mockResolvedValueOnce();
+
+      const res = await request(app)
+        .post('/internal/refund-by-payment')
+        .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
+        .send({ payment_id: 'pay1', amount_centavos: 250050 });
+
+      expect(res.status).toBe(200);
+      expect(refundPayment).toHaveBeenCalledWith('pay1', 2500.5);
+      expect(addPartialRefund).toHaveBeenCalledWith('pay1', 2500.5);
+      expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+
+    it('reports a failed partial refund instead of queueing it (the retry job only refunds in full)', async () => {
+      refundPayment.mockRejectedValueOnce(new Error('boom'));
+
+      const res = await request(app)
+        .post('/internal/refund-by-payment')
+        .set('X-Internal-Key', process.env.INTERNAL_SERVICE_KEY)
+        .send({ payment_id: 'pay1', amount_centavos: 1000 });
+
+      expect(res.status).toBe(502);
+      expect(markTransactionAsRefundFailed).not.toHaveBeenCalled();
+      expect(addPartialRefund).not.toHaveBeenCalled();
+    });
+
     it('accepts a refund Mercado Pago fails as owed (202), flagging it with why, instead of marking it refunded', async () => {
       // refundPayment() itself already no-ops for known-fake ids (mock-/seed-demo- prefixes,
       // see mercadoPago.test.js) -- a rejection reaching this handler means a real payment
@@ -605,6 +637,41 @@ describe('Payment Service App', () => {
 
       expect(res.status).toBe(502);
       expect(markTransactionAsRefundedByPaymentId).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /admin/payments', () => {
+    let adminToken;
+    beforeAll(async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      adminToken = jwt.sign({ role: 'admin', sub: 'admin-1' }, process.env.JWT_SECRET);
+    });
+
+    it('is admin-only', async () => {
+      const res = await request(app).get('/admin/payments');
+      expect(res.status).toBe(401);
+      expect(listTransactions).not.toHaveBeenCalled();
+    });
+
+    it("flags an approved payment whose booking never got paid on ParkLink's side", async () => {
+      listTransactions.mockResolvedValueOnce({
+        total: 2,
+        rows: [
+          { payment_id: 'p1', external_reference: 'b1', amount: '1500.00', refunded_amount: '0', status: 'approved' },
+          { payment_id: 'p2', external_reference: 'b2', amount: '900.00', refunded_amount: '100', status: 'approved' },
+        ],
+      });
+      getBooking.mockResolvedValueOnce({ id: 'b1', status: 'EXPIRED' }).mockResolvedValueOnce({ id: 'b2', status: 'COMPLETED' });
+
+      const res = await request(app).get('/admin/payments?q=b&status=approved').set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.total).toBe(2);
+      expect(res.body.items.map((i) => [i.paymentId, i.needsAttention, i.refundedAmount])).toEqual([
+        ['p1', true, 0],
+        ['p2', false, 100],
+      ]);
+      expect(listTransactions).toHaveBeenCalledWith(expect.objectContaining({ status: 'approved', query: 'b' }));
     });
   });
 
