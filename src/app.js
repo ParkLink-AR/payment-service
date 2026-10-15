@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
+import { reportError } from './monitoring.js';
 import {
   claimFailedRefundForRetry,
   claimTransactionForRefund,
@@ -124,6 +125,7 @@ async function refundUnbookablePayment(paymentId, reason) {
     console.warn(`[Payment] Refunded payment ${paymentId}: booking refused it (${reason})`);
   } catch (error) {
     console.error(`[Payment] Automatic refund of payment ${paymentId} failed, flagged for retry:`, error);
+    reportError(error);
     await markTransactionAsRefundFailed(paymentId, describeRefundError(error), config.refundRetryMaxAttempts);
   }
 }
@@ -231,6 +233,7 @@ export function createApp() {
       res.json({ status: 'ok' });
     } catch (error) {
       console.error('[Payment Service] Health check failed:', error);
+      reportError(error);
       res.status(500).json({ status: 'error' });
     }
   });
@@ -277,6 +280,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Demo Pay] Error:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Demo payment error' });
     }
   });
@@ -332,6 +336,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Service] Error creating preference:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Error creating Mercado Pago preference' });
     }
   });
@@ -379,6 +384,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Webhook] Error processing webhook:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Webhook processing error' });
     }
   });
@@ -396,6 +402,7 @@ export function createApp() {
       res.json({ totalAmount });
     } catch (error) {
       console.error('[Payment Service] Error fetching payment metrics:', error);
+      reportError(error);
       res.status(500).json({ message: 'Internal server error' });
     }
   });
@@ -414,6 +421,7 @@ export function createApp() {
       return res.json(transaction);
     } catch (error) {
       console.error('[Payment Service] Error fetching transaction:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Error fetching transaction' });
     }
   });
@@ -428,6 +436,7 @@ export function createApp() {
       return res.json(transaction);
     } catch (error) {
       console.error('[Payment Service] Error fetching transaction:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Error fetching transaction' });
     }
   });
@@ -514,6 +523,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Verify] Error:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Error verifying payment status' });
     }
   });
@@ -552,6 +562,7 @@ export function createApp() {
       });
     } catch (error) {
       console.error('[Payment Service] Error fetching refund status:', error);
+      reportError(error);
       return res.status(500).json({ message: 'Error fetching refund status' });
     }
   });
@@ -577,6 +588,7 @@ export function createApp() {
           // which would give back more than the admin decided. The admin sees the error and
           // tries again.
           console.error('[Payment] Mercado Pago partial refund failed:', error);
+          reportError(error);
           return res.status(502).json({ success: false, detail: 'Mercado Pago rechazó el reembolso parcial.' });
         }
         await addPartialRefund(payment_id, amount);
@@ -592,6 +604,7 @@ export function createApp() {
         // support team would trust. It's flagged refund_failed instead: the retry job
         // tries again, and the admin panel lists it until someone resolves it.
         console.error('[Payment] Mercado Pago refund failed for a real payment, marking refund_failed:', error);
+        reportError(error);
         const failure = describeRefundError(error);
         const tracked = await markTransactionAsRefundFailed(payment_id, failure, config.refundRetryMaxAttempts);
         if (tracked) {
@@ -663,6 +676,7 @@ export function createApp() {
       return res.json({ items, total });
     } catch (error) {
       console.error('[Payments] Error listing payments:', error);
+      reportError(error);
       return res.status(500).json({ detail: 'Error listing payments' });
     }
   });
@@ -672,6 +686,7 @@ export function createApp() {
       return res.json({ count: await countFailedRefunds() });
     } catch (error) {
       console.error('[Refunds] Error counting failed refunds:', error);
+      reportError(error);
       return res.status(500).json({ detail: 'Error counting failed refunds' });
     }
   });
@@ -710,6 +725,7 @@ export function createApp() {
       return res.json({ items });
     } catch (error) {
       console.error('[Refunds] Error listing failed refunds:', error);
+      reportError(error);
       return res.status(500).json({ detail: 'Error listing failed refunds' });
     }
   });
@@ -726,6 +742,7 @@ export function createApp() {
       } catch (error) {
         const failure = describeRefundError(error);
         console.error(`[Refunds] Manual retry of payment ${paymentId} failed:`, error);
+        reportError(error);
         await markTransactionAsRefundFailed(paymentId, failure, config.refundRetryMaxAttempts);
         return res.status(502).json({ code: failure.code, detail: failure.detail });
       }
@@ -735,6 +752,7 @@ export function createApp() {
       return res.json({ status: 'refunded' });
     } catch (error) {
       console.error('[Refunds] Error retrying refund:', error);
+      reportError(error);
       return res.status(500).json({ detail: 'Error retrying refund' });
     }
   });
@@ -764,6 +782,7 @@ export function createApp() {
       return res.json({ status: resolved.status });
     } catch (error) {
       console.error('[Refunds] Error resolving refund:', error);
+      reportError(error);
       return res.status(500).json({ detail: 'Error resolving refund' });
     }
   });

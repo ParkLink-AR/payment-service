@@ -1,7 +1,10 @@
+import { initMonitoring } from './monitoring.js';
 import { createApp } from './app.js';
 import { config } from './config.js';
 import { initDatabase } from './db.js';
 import { startRefundRetryJob } from './refundRetryJob.js';
+
+initMonitoring();
 
 async function bootstrap() {
   await initDatabase();
