@@ -10,6 +10,7 @@ function internalHeaders() {
 }
 
 // The booking as booking-service sees it -- { id, user_id, status, amount (centavos),
+// debt_amount (centavos, the driver's pending balances it took on: the payment covers both),
 // hold_expires_at } -- or null if it doesn't exist. Throws on any other failure.
 export async function getBooking(bookingId) {
   const response = await fetch(
@@ -23,6 +24,19 @@ export async function getBooking(bookingId) {
     throw new Error(`booking-service responded ${response.status}`);
   }
   return response.json();
+}
+
+// The pending balances bookingId's payment includes -- [{ amount (centavos), minutes,
+// booking_start, parking_spot_title, ... }] -- for wording the checkout. Throws on failure.
+export async function getBookingDebts(bookingId) {
+  const response = await fetch(
+    `${config.bookingServiceUrl}/internal/bookings/${encodeURIComponent(bookingId)}/debts`,
+    { headers: internalHeaders() },
+  );
+  if (!response.ok) {
+    throw new Error(`booking-service responded ${response.status}`);
+  }
+  return (await response.json()).debts ?? [];
 }
 
 // Asks booking-service to confirm bookingId as paid by paymentId, which charged

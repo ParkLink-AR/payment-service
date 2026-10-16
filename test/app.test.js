@@ -27,6 +27,7 @@ jest.unstable_mockModule('../src/events.js', () => ({ announceRefundCompleted })
 
 jest.unstable_mockModule('../src/bookingClient.js', () => ({
   getBooking: jest.fn(),
+  getBookingDebts: jest.fn(),
   confirmBooking: jest.fn()
 }));
 
@@ -58,7 +59,7 @@ const {
   resolveFailedRefund
 } = await import('../src/db.js');
 
-const { getBooking, confirmBooking } = await import('../src/bookingClient.js');
+const { getBooking, getBookingDebts, confirmBooking } = await import('../src/bookingClient.js');
 
 const {
   createCheckoutPreference,
@@ -172,6 +173,75 @@ describe('Payment Service App', () => {
       expect(createCheckoutPreference).toHaveBeenCalledWith(
         expect.objectContaining({ amount: 1500, externalReference: 'booking-1', expiresAt: booking.hold_expires_at }),
       );
+    });
+
+    it('adds no extra line when the booking took on no pending balance', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_1', init_point: 'https://mp.com/1' });
+
+      await request(app).post('/api/payments/create-preference').set('x-user-id', DRIVER_ID).send({ externalReference: 'booking-1' });
+
+      expect(createCheckoutPreference).toHaveBeenCalledWith(expect.objectContaining({ extraItems: [] }));
+      expect(getBookingDebts).not.toHaveBeenCalled();
+    });
+
+    it('itemises each pending balance the booking took on, saying where and which booking it was', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ debt_amount: 10000 }));
+      getBookingDebts.mockResolvedValueOnce([
+        { amount: 6000, minutes: 20, booking_start: '2026-10-12T21:00:00Z', parking_spot_title: 'Cochera Centro' },
+        { amount: 4000, minutes: 15, booking_start: '2026-10-03T13:00:00Z', parking_spot_title: 'Cochera Norte' },
+      ]);
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_1', init_point: 'https://mp.com/1' });
+
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1' });
+
+      expect(res.status).toBe(201);
+      const { amount, extraItems } = createCheckoutPreference.mock.calls[0][0];
+      expect(amount).toBe(1500);
+      expect(extraItems).toEqual([
+        {
+          title: 'Saldo pendiente por exceso en Cochera Centro',
+          description: 'Saldo pendiente por exceso en Cochera Centro, reserva del 12/10, 20 min',
+          amount: 60,
+        },
+        {
+          title: 'Saldo pendiente por exceso en Cochera Norte',
+          description: 'Saldo pendiente por exceso en Cochera Norte, reserva del 03/10, 15 min',
+          amount: 40,
+        },
+      ]);
+      expect(amount + extraItems.reduce((total, item) => total + item.amount, 0)).toBe(1600);
+    });
+
+    it('still charges the whole debt, as one generic line, when booking-service cannot say what it is made of', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ debt_amount: 10000 }));
+      getBookingDebts.mockRejectedValueOnce(new Error('booking-service responded 500'));
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_1', init_point: 'https://mp.com/1' });
+
+      const res = await request(app)
+        .post('/api/payments/create-preference')
+        .set('x-user-id', DRIVER_ID)
+        .send({ externalReference: 'booking-1' });
+
+      expect(res.status).toBe(201);
+      expect(createCheckoutPreference.mock.calls[0][0].extraItems).toEqual([
+        expect.objectContaining({ title: 'Saldo pendiente por exceso de tiempo', amount: 100 }),
+      ]);
+    });
+
+    it('falls back to the generic line when the listed balances do not add up to the debt', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking({ debt_amount: 10000 }));
+      getBookingDebts.mockResolvedValueOnce([{ amount: 6000, minutes: 20, booking_start: '2026-10-12T21:00:00Z', parking_spot_title: 'X' }]);
+      createCheckoutPreference.mockResolvedValueOnce({ id: 'pref_1', init_point: 'https://mp.com/1' });
+
+      await request(app).post('/api/payments/create-preference').set('x-user-id', DRIVER_ID).send({ externalReference: 'booking-1' });
+
+      expect(createCheckoutPreference.mock.calls[0][0].extraItems).toEqual([
+        expect.objectContaining({ title: 'Saldo pendiente por exceso de tiempo', amount: 100 }),
+      ]);
     });
 
     it('should handle internal errors', async () => {
@@ -552,6 +622,24 @@ describe('Payment Service App', () => {
       expect(res.status).toBe(201);
       expect(res.body.status).toBe('approved');
       expect(confirmBooking).toHaveBeenCalledWith('b1', expect.stringMatching(/^demo-/), 150000);
+    });
+  });
+
+  describe('POST /api/payments/demo-pay with a pending balance', () => {
+    it('pays the price of the booking and the balance it took on, which is what booking-service expects', async () => {
+      const jwt = (await import('jsonwebtoken')).default;
+      const adminToken = jwt.sign({ role: 'admin' }, process.env.JWT_SECRET);
+      getBooking.mockResolvedValueOnce({ id: 'b1', user_id: 'd1', status: 'PENDING_PAYMENT', amount: 150000, debt_amount: 10000 });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
+      saveTransaction.mockResolvedValueOnce({ id: 'tx1' });
+
+      const res = await request(app)
+        .post('/api/payments/demo-pay')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ bookingId: 'b1' });
+
+      expect(res.status).toBe(201);
+      expect(confirmBooking).toHaveBeenCalledWith('b1', expect.stringMatching(/^demo-/), 160000);
     });
   });
 

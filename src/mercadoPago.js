@@ -32,6 +32,7 @@ export async function createCheckoutPreference({
   backUrls,
   notificationUrl,
   expiresAt,
+  extraItems = [],
 }) {
   const normalizedBackUrls = backUrls
     ? {
@@ -50,7 +51,18 @@ export async function createCheckoutPreference({
     Boolean(normalizedBackUrls?.success) && normalizedBackUrls.success.startsWith('https://');
 
   const preferenceBody = {
-    items: [{ title, description, quantity: 1, unit_price: amount, currency_id: currency }],
+    // The booking's own price, then (if the driver carries any) each pending balance on its own line, so
+    // the checkout itemises exactly what the total is made of.
+    items: [
+      { title, description, quantity: 1, unit_price: amount, currency_id: currency },
+      ...extraItems.map((item) => ({
+        title: item.title,
+        description: item.description,
+        quantity: 1,
+        unit_price: item.amount,
+        currency_id: currency,
+      })),
+    ],
     payer: payerEmail ? { email: payerEmail } : undefined,
     external_reference: externalReference,
     back_urls: normalizedBackUrls,
