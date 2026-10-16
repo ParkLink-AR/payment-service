@@ -52,6 +52,23 @@ describe('MercadoPago Module', () => {
       expect(body.expires).toBe(true);
       expect(body.expiration_date_to).toBe('2026-10-05T12:05:00.000Z');
     });
+
+    it('adds a line for each extra item after the own price of the booking', async () => {
+      await mp.createCheckoutPreference({
+        amount: 1500,
+        title: 'Reserva ParkLink',
+        description: 'Test Desc',
+        currency: 'ARS',
+        externalReference: 'booking-1',
+        extraItems: [{ title: 'Saldo pendiente por exceso en Cochera X', description: 'reserva del 12/10, 20 min', amount: 60 }],
+      });
+
+      const body = preferenceCreate.mock.calls[0][0].body;
+      expect(body.items).toEqual([
+        { title: 'Reserva ParkLink', description: 'Test Desc', quantity: 1, unit_price: 1500, currency_id: 'ARS' },
+        { title: 'Saldo pendiente por exceso en Cochera X', description: 'reserva del 12/10, 20 min', quantity: 1, unit_price: 60, currency_id: 'ARS' },
+      ]);
+    });
   });
 
   describe('getPaymentById', () => {

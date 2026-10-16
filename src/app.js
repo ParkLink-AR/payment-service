@@ -25,7 +25,7 @@ import {
   refundPayment,
   searchPaymentByExternalReference,
 } from './mercadoPago.js';
-import { confirmBooking, getBooking } from './bookingClient.js';
+import { confirmBooking, getBooking, getBookingDebts } from './bookingClient.js';
 import { getTotalTransactionAmount, getTransactionAmountByPeriod } from './db.js';
 import { requireAdmin, requireInternalKey, requireGatewaySecret } from './security.js';
 import { announceRefundCompleted } from './events.js';
@@ -163,6 +163,56 @@ async function confirmBookingIfApproved(payment) {
   }
 }
 
+// "03/10": the day and month of instant in Buenos Aires, whatever the server's own timezone.
+function formatBuenosAiresDay(instant) {
+  const parts = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    day: 'numeric',
+    month: 'numeric',
+  }).formatToParts(new Date(instant));
+  const pick = (type) => String(parts.find((part) => part.type === type)?.value ?? '').padStart(2, '0');
+  return `${pick('day')}/${pick('month')}`;
+}
+
+// What a booking charges on top of its own price, as checkout lines: the pending balances the driver
+// carried from earlier bookings in which they stayed past the end. One line per balance, saying
+// where and which booking it was ("Saldo pendiente por exceso en Cochera X, reserva del 12/10, 20
+// min"), so the driver sees exactly what the total is made of. If booking-service can't say
+// (or its lines don't add up to the debt), a single generic line carries the same amount: the
+// total is what matters.
+async function debtCheckoutItems(booking) {
+  const total = Number(booking.debt_amount || 0);
+  if (total <= 0) {
+    return [];
+  }
+  const generic = [
+    {
+      title: 'Saldo pendiente por exceso de tiempo',
+      description: 'Saldo pendiente por haberte quedado más tiempo del reservado en una reserva anterior',
+      amount: total / 100,
+    },
+  ];
+  try {
+    const debts = await getBookingDebts(booking.id);
+    const sum = debts.reduce((acc, debt) => acc + Number(debt.amount), 0);
+    if (debts.length === 0 || sum !== total) {
+      return generic;
+    }
+    return debts.map((debt) => {
+      const where = debt.parking_spot_title || 'una cochera';
+      const day = formatBuenosAiresDay(debt.booking_start);
+      return {
+        title: `Saldo pendiente por exceso en ${where}`.slice(0, 120),
+        description: `Saldo pendiente por exceso en ${where}, reserva del ${day}, ${debt.minutes} min`.slice(0, 255),
+        amount: Number(debt.amount) / 100,
+      };
+    });
+  } catch (error) {
+    console.error('[Payment Service] Could not word the pending balances, charging them as one line:', error.message);
+    return generic;
+  }
+}
+
 // The authenticated caller (set by the gateway) may act on bookingId's payment only if it's
 // their own booking. Resolves to the booking, or sends the error response and resolves to
 // null.
@@ -260,7 +310,7 @@ export function createApp() {
       const fakePayment = {
         id: paymentId,
         status: 'approved',
-        transaction_amount: booking.amount / 100,
+        transaction_amount: (booking.amount + (booking.debt_amount || 0)) / 100,
         currency_id: 'ARS',
         external_reference: bookingId,
         payer: { email: payerEmail || 'demo@pll.com' },
@@ -285,8 +335,8 @@ export function createApp() {
     }
   });
 
-  // The amount charged is always the booking's own server-side price (from
-  // booking-service), never anything the client sends -- and only the booking's own driver
+  // The amount charged is always the booking's own server-side price plus the pending balances it
+  // took on (from booking-service), never anything the client sends -- and only the booking's own driver
   // can open a checkout for it, while its hold is still running.
   app.post('/api/payments/create-preference', requireGatewaySecret, async (req, res) => {
     try {
@@ -319,6 +369,7 @@ export function createApp() {
 
       const preference = await createCheckoutPreference({
         amount: booking.amount / 100,
+        extraItems: await debtCheckoutItems(booking),
         title,
         description,
         currency: config.defaultCurrency,
