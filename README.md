@@ -43,7 +43,6 @@ Variables importantes:
 - `DATABASE_URL`: conexion a PostgreSQL.
 - `APP_BASE_URL`: URL base del servicio.
 - `WEBHOOK_BASE_URL`: URL publica del servicio para webhooks.
-- `FRONTEND_SUCCESS_URL`, `FRONTEND_FAILURE_URL`, `FRONTEND_PENDING_URL`: URLs de retorno.
 
 ### Buscar mail de prueba
 
@@ -65,9 +64,6 @@ MERCADOPAGO_WEBHOOK_SECRET=REEMPLAZAR_CON_LA_SECRET_DE_MERCADO_PAGO
 MP_FORCE_TEST_PAYER_EMAIL = test_user.....@testuser.com
 APP_BASE_URL=http://localhost:8004
 WEBHOOK_BASE_URL=http://localhost:8004
-FRONTEND_SUCCESS_URL=https://example.com/payment/success
-FRONTEND_FAILURE_URL=https://example.com/payment/failure
-FRONTEND_PENDING_URL=https://example.com/payment/pending
 DEFAULT_CURRENCY=ARS
 ```
 
@@ -148,7 +144,6 @@ Link 2: https://www.mercadopago.com.ar/checkout/v1/redirect?pref_id=...
 Si falla con errores de autorización o `back_url.success`:
 
 - Revisa que `MERCADOPAGO_ACCESS_TOKEN` sea válido.
-- Usa URLs `https` para `FRONTEND_SUCCESS_URL`, `FRONTEND_FAILURE_URL`, `FRONTEND_PENDING_URL`.
 
 ## Endpoints
 

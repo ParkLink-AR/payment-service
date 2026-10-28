@@ -1,9 +1,12 @@
 import dotenv from 'dotenv';
 
-dotenv.config();
+// Tests (Jest sets NODE_ENV=test) must not pick up the developer's real .env.
+if (process.env.NODE_ENV !== 'test') {
+  dotenv.config();
+}
 
-const accessToken = process.env.MERCADOPAGO_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN;
-const webhookSecret = process.env.MERCADOPAGO_WEBHOOK_SECRET || process.env.MERCADO_PAGO_WEBHOOK_SECRET;
+const accessToken = process.env.MERCADOPAGO_ACCESS_TOKEN;
+const webhookSecret = process.env.MERCADOPAGO_WEBHOOK_SECRET;
 
 const requiredEnv = [
   'DATABASE_URL',

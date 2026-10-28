@@ -1,9 +1,5 @@
 import assert from 'node:assert/strict';
 
-process.env.FRONTEND_SUCCESS_URL = 'https://example.com/payment/success';
-process.env.FRONTEND_FAILURE_URL = 'https://example.com/payment/failure';
-process.env.FRONTEND_PENDING_URL = 'https://example.com/payment/pending';
-
 const { createApp } = await import('../src/app.js');
 
 async function createPreference(baseUrl, index) {
