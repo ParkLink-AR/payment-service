@@ -69,6 +69,7 @@ const {
 } = await import('../src/mercadoPago.js');
 
 const { createApp } = await import('../src/app.js');
+const { config } = await import('../src/config.js');
 
 describe('Payment Service App', () => {
   let app;
@@ -622,6 +623,75 @@ describe('Payment Service App', () => {
       expect(res.status).toBe(201);
       expect(res.body.status).toBe('approved');
       expect(confirmBooking).toHaveBeenCalledWith('b1', expect.stringMatching(/^demo-/), 150000);
+    });
+  });
+
+  describe('POST /api/payments/force-approve', () => {
+    const force = (body) => request(app).post('/api/payments/force-approve').set('x-user-id', DRIVER_ID).send(body);
+    const pending = (overrides = {}) =>
+      ownBooking({ status: 'PENDING_PAYMENT', amount: 150000, hold_expires_at: new Date(Date.now() + 600000).toISOString(), ...overrides });
+
+    afterEach(() => {
+      config.allowForceApproval = false;
+    });
+
+    it('is refused unless the demo switch is on', async () => {
+      const res = await force({ externalReference: 'booking-1' });
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe('FORCE_APPROVAL_DISABLED');
+      expect(saveTransaction).not.toHaveBeenCalled();
+    });
+
+    it('marks the caller\'s own booking as paid at its own price', async () => {
+      config.allowForceApproval = true;
+      getBooking.mockResolvedValueOnce(pending()).mockResolvedValueOnce(pending({ status: 'CONFIRMED' }));
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
+      saveTransaction.mockResolvedValueOnce({ id: 'tx1' });
+
+      const res = await force({ externalReference: 'booking-1' });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('approved');
+      expect(confirmBooking).toHaveBeenCalledWith('booking-1', expect.stringMatching(/^demo-/), 150000);
+    });
+
+    it('refuses someone else\'s booking', async () => {
+      config.allowForceApproval = true;
+      getBooking.mockResolvedValueOnce(pending({ user_id: 'someone-else' }));
+      const res = await force({ externalReference: 'booking-1' });
+      expect(res.status).toBe(403);
+      expect(saveTransaction).not.toHaveBeenCalled();
+    });
+
+    it('refuses a booking that is not awaiting payment, or whose hold ran out', async () => {
+      config.allowForceApproval = true;
+      getBooking.mockResolvedValueOnce(pending({ status: 'CONFIRMED' }));
+      expect((await force({ externalReference: 'booking-1' })).status).toBe(409);
+      getBooking.mockResolvedValueOnce(pending({ hold_expires_at: new Date(Date.now() - 1000).toISOString() }));
+      expect((await force({ externalReference: 'booking-1' })).status).toBe(409);
+      expect(saveTransaction).not.toHaveBeenCalled();
+    });
+
+    it('does not answer approved when booking-service refuses to confirm', async () => {
+      config.allowForceApproval = true;
+      getBooking.mockResolvedValueOnce(pending()).mockResolvedValueOnce(pending());
+      confirmBooking.mockResolvedValueOnce({ ok: false, status: 500, code: null });
+      saveTransaction.mockResolvedValueOnce({ id: 'tx1' });
+      expect((await force({ externalReference: 'booking-1' })).status).toBe(502);
+    });
+  });
+
+  describe('POST /api/payments/verify-status for a forced payment', () => {
+    it('reads the stored record instead of asking Mercado Pago about a demo id', async () => {
+      getBooking.mockResolvedValueOnce(ownBooking());
+      getTransactionByExternalReference.mockResolvedValueOnce({ payment_id: 'demo-1', status: 'approved', amount: '1500.00' });
+      confirmBooking.mockResolvedValueOnce({ ok: true, status: 200, code: null });
+
+      const res = await request(app).post('/api/payments/verify-status').set('x-user-id', DRIVER_ID).send({ externalReference: 'booking-1' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.currentStatus).toBe('approved');
+      expect(getPaymentById).not.toHaveBeenCalled();
     });
   });
 
