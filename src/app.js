@@ -163,27 +163,6 @@ async function confirmBookingIfApproved(payment) {
   }
 }
 
-// Records a payment that never went through Mercado Pago ("demo-" id) as approved for the
-// booking, at its own server-side price plus the pending balances it took on, and confirms
-// the booking with it. Shared by demo-pay (admin) and force-approve (the driver's app).
-async function approveWithDemoPayment(booking, payerEmail) {
-  const paymentId = `demo-${crypto.randomUUID()}`;
-  const fakePayment = {
-    id: paymentId,
-    status: 'approved',
-    transaction_amount: (booking.amount + (booking.debt_amount || 0)) / 100,
-    currency_id: 'ARS',
-    external_reference: booking.id,
-    payer: { email: payerEmail || 'demo@pll.com' },
-    date_approved: new Date().toISOString(),
-    order: {},
-    metadata: {},
-  };
-  const transaction = await saveTransaction(fakePayment);
-  await confirmBookingIfApproved(fakePayment);
-  return { paymentId, transaction };
-}
-
 // "03/10": the day and month of instant in Buenos Aires, whatever the server's own timezone.
 function formatBuenosAiresDay(instant) {
   const parts = new Intl.DateTimeFormat('es-AR', {
@@ -327,7 +306,21 @@ export function createApp() {
         return res.status(404).json({ message: 'Booking not found' });
       }
 
-      const { paymentId, transaction } = await approveWithDemoPayment(booking, payerEmail);
+      const paymentId = `demo-${crypto.randomUUID()}`;
+      const fakePayment = {
+        id: paymentId,
+        status: 'approved',
+        transaction_amount: (booking.amount + (booking.debt_amount || 0)) / 100,
+        currency_id: 'ARS',
+        external_reference: bookingId,
+        payer: { email: payerEmail || 'demo@pll.com' },
+        date_approved: new Date().toISOString(),
+        order: {},
+        metadata: {},
+      };
+
+      const transaction = await saveTransaction(fakePayment);
+      await confirmBookingIfApproved(fakePayment);
 
       return res.status(201).json({
         paymentId,
@@ -339,41 +332,6 @@ export function createApp() {
       console.error('[Demo Pay] Error:', error);
       reportError(error);
       return res.status(500).json({ message: 'Demo payment error' });
-    }
-  });
-
-  // The app's "Consultar pago" button for demos: when Mercado Pago fails, the driver forces
-  // their own booking to be taken as paid. Off unless ALLOW_FORCE_PAYMENT_APPROVAL=true, and
-  // only for the caller's own booking while it awaits payment and its hold is running.
-  app.post('/api/payments/force-approve', requireGatewaySecret, async (req, res) => {
-    try {
-      if (!config.allowForceApproval) {
-        return res.status(403).json({ code: 'FORCE_APPROVAL_DISABLED', message: 'Forcing a payment is not enabled' });
-      }
-      const booking = await loadOwnBooking(req, res, req.body?.externalReference);
-      if (!booking) {
-        return;
-      }
-      if (booking.status !== 'PENDING_PAYMENT') {
-        return res.status(409).json({ code: 'BOOKING_NOT_PAYABLE', message: 'Booking is not awaiting payment' });
-      }
-      if (booking.hold_expires_at && new Date(booking.hold_expires_at) <= new Date()) {
-        return res.status(409).json({ code: 'HOLD_EXPIRED', message: 'Booking hold has expired' });
-      }
-
-      const { paymentId } = await approveWithDemoPayment(booking, req.body?.payerEmail);
-
-      // confirmBookingIfApproved only logs when booking-service refuses: say so instead of
-      // answering "approved" for a booking that is still unpaid.
-      const after = await getBooking(booking.id);
-      if (!after || after.status === 'PENDING_PAYMENT') {
-        return res.status(502).json({ code: 'CONFIRM_FAILED', message: 'The booking could not be confirmed' });
-      }
-      return res.status(201).json({ paymentId, status: 'approved', bookingId: booking.id });
-    } catch (error) {
-      console.error('[Force Approve] Error:', error);
-      reportError(error);
-      return res.status(500).json({ message: 'Error forcing the payment' });
     }
   });
 
@@ -547,16 +505,7 @@ export function createApp() {
 
       let payment = null;
       let transaction = await getTransactionByExternalReference(externalReference);
-      if (transaction && String(transaction.payment_id).startsWith('demo-')) {
-        // A forced payment (demo-pay / force-approve) doesn't exist on Mercado Pago: our own
-        // record is the payment.
-        payment = {
-          id: transaction.payment_id,
-          status: transaction.status,
-          external_reference: externalReference,
-          transaction_amount: Number(transaction.amount),
-        };
-      } else if (transaction) {
+      if (transaction) {
         payment = await getPaymentById(transaction.payment_id);
       }
 

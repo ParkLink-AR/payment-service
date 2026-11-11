@@ -77,19 +77,11 @@ export const config = {
   // Useful when tunnelling the webhook to a laptop and the secret/signature
   // don't line up. NEVER set this in a real deployment.
   skipWebhookSignature: process.env.MP_SKIP_WEBHOOK_SIGNATURE === 'true',
-  // Demo escape hatch: lets a driver mark their own booking as paid from the app's
-  // "Consultar pago" button when Mercado Pago fails (POST /api/payments/force-approve).
-  // Off unless explicitly set -- with it on, anyone can book without paying.
-  allowForceApproval: process.env.ALLOW_FORCE_PAYMENT_APPROVAL === 'true',
   // admin-dashboard fetches /api/payments/metrics directly (not through the
   // gateway), so this service needs its own CORS allowlist. Same default as
   // gateway's own CORS_ORIGINS -- tighten in production via env.
   corsOrigins: process.env.CORS_ORIGINS || '*',
 };
-
-if (config.allowForceApproval) {
-  console.warn('[Config] ALLOW_FORCE_PAYMENT_APPROVAL=true — drivers can mark their bookings as paid without paying. Demo only.');
-}
 
 if (config.skipWebhookSignature) {
   console.warn('[Config] MP_SKIP_WEBHOOK_SIGNATURE=true — Mercado Pago webhook signature verification is DISABLED. Dev only.');
